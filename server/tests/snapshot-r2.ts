@@ -59,11 +59,28 @@ function assertEqual<T>(actual: T, expected: T, msg: string): void {
 
 const instances: Miniflare[] = [];
 
+/**
+ * Miniflare 5 dropped the flat single-worker options (`modules` / `script` /
+ * `r2Buckets`) in favour of an explicit `workers[]` array carrying a worker
+ * config. The worker itself is irrelevant here — these tests only need a real
+ * R2 binding — but a module and a compatibility date are mandatory.
+ */
+const NOOP_WORKER_SCRIPT = "export default { fetch() { return new Response('ok'); } }";
+
 async function getBucket(): Promise<R2Bucket> {
 	const mf = new Miniflare({
-		modules: true,
-		script: "export default { fetch() { return new Response('ok'); } }",
-		r2Buckets: ["BUCKET"],
+		workers: [{
+			config: {
+				type: "worker",
+				name: "snapshot-r2-test",
+				compatibilityDate: "2026-01-01",
+				manifest: {
+					mainModule: "index.mjs",
+					modules: { "index.mjs": { type: "esm", contents: NOOP_WORKER_SCRIPT } },
+				},
+				env: { BUCKET: { type: "r2", name: "BUCKET" } },
+			},
+		}],
 	});
 	instances.push(mf);
 	return await mf.getR2Bucket("BUCKET");
