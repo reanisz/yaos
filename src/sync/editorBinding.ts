@@ -9,6 +9,7 @@ import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import { ORIGIN_EDITOR_HEALTH_HEAL } from "./origins";
+import { deviceCursorColor } from "../utils/deviceCursorColor";
 
 /**
  * Manages per-editor CM6 bindings via yCollab.
@@ -1292,9 +1293,7 @@ export class EditorBindingManager {
 
 		this.vaultSync.provider.awareness.setLocalStateField("user", {
 			name: deviceName,
-			// TODO: configurable color
-			color: "#30bced",
-			colorLight: "#30bced33",
+			...deviceCursorColor(deviceName),
 		});
 
 		const collabExtension = this.buildCollabExtension(ytext, undoManager);
