@@ -60,3 +60,18 @@ export function arrayBufferToHex(buf: ArrayBuffer): string {
 		byte.toString(16).padStart(2, "0")
 	).join("");
 }
+
+export let apiVersion = "1.12.7";
+
+export const Platform = {
+	isMobile: false,
+};
+
+export async function requestUrl(_request: unknown): Promise<{
+	status: number;
+	json: unknown;
+	text: string;
+	arrayBuffer: ArrayBuffer;
+}> {
+	throw new Error("requestUrl is not stubbed for this test");
+}

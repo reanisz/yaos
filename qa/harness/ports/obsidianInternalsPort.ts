@@ -67,6 +67,20 @@ interface AppInternals {
 }
 
 /**
+ * Reads `app` as this port's view of the runtime.
+ *
+ * Deliberately not `App & AppInternals`: the product now augments `App.plugins`
+ * with its own `CommunityPluginsManager` view for `settingsSync`, and two
+ * honest descriptions of the same undeclared surface do not have to agree. The
+ * accessors below validate before returning, so the widening is checked rather
+ * than assumed.
+ */
+function internalsOf(app: App): AppInternals {
+	const runtime: unknown = app;
+	return runtime as AppInternals;
+}
+
+/**
  * The plugin registry, or null when Obsidian does not expose one.
  *
  * Null rather than throw: the harness's first guard reports a missing registry
@@ -74,7 +88,7 @@ interface AppInternals {
  * useful to whoever is running QA than a stack trace out of onload().
  */
 export function getPluginRegistry(app: App): ObsidianPluginRegistry | null {
-	const internals: App & AppInternals = app;
+	const internals = internalsOf(app);
 	const registry = internals.plugins;
 	if (!registry || !registry.plugins || typeof registry.plugins !== "object") return null;
 	return registry;
@@ -87,7 +101,7 @@ export function getPluginRegistry(app: App): ObsidianPluginRegistry | null {
  * to fall back to, so an unrunnable command has to fail the scenario.
  */
 export function getCommandRegistry(app: App): ObsidianCommandRegistry {
-	const internals: App & AppInternals = app;
+	const internals = internalsOf(app);
 	const registry = internals.commands;
 	if (!registry || typeof registry.executeCommandById !== "function") {
 		throw new Error(

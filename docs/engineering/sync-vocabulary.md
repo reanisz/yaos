@@ -41,7 +41,7 @@ gates the planes).
 | `diskImport` | `sync/diskMirror.ts`, `sync/diskIndex.ts`, `sync/externalEditPolicy.ts` | same | Importing filesystem changes made outside the live editor. |
 | `attachments` | `sync/blobSync.ts`, `runtime/attachmentOrchestrator.ts` | same | R2-backed sync of non-text and oversized files. |
 | `snapshots` | `sync/snapshotClient.ts`, `snapshots/snapshotService.ts` | same | Server-side backup capture and restore. |
-| `settingsSync` | not yet implemented | TBD | `.obsidian/` sync. Reserved name only. |
+| `settingsSync` | not yet implemented | `sync/settingsSync/` | `.obsidian/` environment replication. See `docs/rfcs/settings-sync.md`. Desktop smoke lives in `obsidianPluginInstall.ts`. |
 
 ### Control and guard systems
 

@@ -1,9 +1,15 @@
-import { Notice, type Plugin } from "obsidian";
+import { Notice, type App, type Plugin } from "obsidian";
 import type { ConnectionController } from "./runtime/connectionController";
 import type { SnapshotService } from "./snapshots/snapshotService";
+import {
+	confirmAndSmokeInstallCalendar,
+	noticeForInstallResult,
+} from "./sync/settingsSync/obsidianPluginInstall";
 import type { ReconcileMode, VaultSync } from "./sync/vaultSync";
 
 export interface CommandsRuntimeHost {
+	getApp(): App;
+	includeSettingsSyncSmoke(): boolean;
 	getVaultSync(): VaultSync | null;
 	getConnectionController(): ConnectionController | null;
 	getSnapshotService(): SnapshotService | null;
@@ -132,4 +138,14 @@ export function registerCommands(
 			host.nuclearReset();
 		},
 	});
+
+	if (host.includeSettingsSyncSmoke()) {
+		registrar.addCommand({
+			id: "smoke-install-calendar",
+			name: "Smoke-install Calendar via Obsidian",
+			callback: () => {
+				void confirmAndSmokeInstallCalendar(host.getApp()).then(noticeForInstallResult);
+			},
+		});
+	}
 }

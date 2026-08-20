@@ -919,6 +919,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// 7. Commands
 			if (!this.commandsRegistered) {
 				registerCommands(this, {
+					getApp: () => this.app,
+					includeSettingsSyncSmoke: () => this.settings.debug,
 					getVaultSync: () => this.vaultSync,
 					getConnectionController: () => this.connectionController,
 					getSnapshotService: () => this.snapshotService,
