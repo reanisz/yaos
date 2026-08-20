@@ -37,11 +37,12 @@ volatile, or machine-specific working material belongs in ignored `notes/`.
 - [Frontmatter integrity](rfcs/frontmatter-integrity.md)
 - [Durable Object hardening](rfcs/do-hardening.md)
 - [Zero-ops update pipeline](rfcs/zero-ops-update-pipeline.md)
+- [`.obsidian` settings sync](rfcs/settings-sync.md)
 
 ## QA
 
-See [QA documentation](qa/README.md) for the current harness status, reusable
-runbooks, and fixture-vault preparation guidance.
+See [QA documentation](qa/README.md) for the mobile testing guide, current
+harness status, reusable runbooks, and fixture-vault preparation guidance.
 
 ## Archive
 

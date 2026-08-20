@@ -1,5 +1,9 @@
 # YAOS QA Runbook (Split Execution)
 
+> **Archived.** Completed evidence for v1.0.0 scope. The reusable procedure has
+> been synthesised into [docs/qa/mobile-testing.md](../../qa/mobile-testing.md);
+> use that for a new device run and this file only for provenance.
+
 This runbook is split into two runs:
 
 - `Run A (completed on 2026-03-08)`: migration drill + schema divergence loud-failure check
