@@ -111,7 +111,19 @@ The commit SHA lets us verify the exact server snapshot Cloudflare built, which 
 
 ### WebSocket sync
 
-- `wss://<host>/vault/sync/<vaultId>?token=<setup-token>`
+- `wss://<host>/vault/sync/<vaultId>?ticket=<short-lived-ticket>` — the current
+  path. The plugin first calls `POST /vault/<vaultId>/auth/ticket` with the
+  bearer token, then puts only the returned 5-minute ticket in the URL.
+- `wss://<host>/vault/sync/<vaultId>?token=<setup-token>` — legacy, still
+  accepted during the migration window. Every use logs
+  `legacy ?token= WebSocket auth for vault <id>` so you can watch adoption.
+
+Close the legacy path once that log line stops appearing: uncomment
+`YAOS_DISABLE_LEGACY_WS_TOKEN = "true"` under `[vars]` in `server/wrangler.toml`
+and redeploy. Legacy connections are then rejected with 401 before the vault
+Durable Object is woken; ticket connections are unaffected. Comment it back out
+to roll back. See [zero-config auth](../architecture/zero-config-auth.md) for
+the ticket format and threat model.
 
 ### Blob APIs
 
