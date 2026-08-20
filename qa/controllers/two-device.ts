@@ -1116,7 +1116,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	//     suspend/kill), the baseline is not persisted. The
 	//     missing-baseline path now uses diskMtime evidence:
 	//     if diskMtime > lastDiskIndexPersistedAt → disk wins.
-	//     Repro: qa/scripts/repro-missing-baseline-kill.ts
+	//     Repro: qa/repros/repro-missing-baseline-kill.ts
 	//     See also: docs/engineering/bug-rca-ledger.md Issue #22-B cold-relaunch variant
 	// ───────────────────────────────────────────────────────────────────
 

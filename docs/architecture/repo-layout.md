@@ -10,6 +10,8 @@ src/                Product source only
 src/telemetry/      Debug runtime: flight recorder and diagnostics, compiled
                     into the product bundle and inert unless `debug` is on
 qa/                 Puppeteer harness, controllers, analyzers, scripts, and fixtures
+qa/scripts/         Supported QA tooling only: vault preparation, manifest, compare
+qa/repros/          Incident reproductions and trace readers kept as RCA evidence
 server/             Cloudflare Worker package and server source
 tests/              Node/regression/integration coverage
 docs/               Durable tracked project documentation

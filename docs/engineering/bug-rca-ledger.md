@@ -33,7 +33,7 @@ Repo-validated bug / incident ledger as of 2026-05-27.
 - This is a different code path from the clean-disable case above. The clean-disable path
   persists the baseline via `teardownSync → flushAllPendingWrites → saveDiskIndex` before
   any kill. The cold-kill path bypasses `teardownSync` entirely, leaving `baselineHash` null.
-- Desktop repro: `qa/scripts/repro-missing-baseline-kill.ts`
+- Desktop repro: `qa/repros/repro-missing-baseline-kill.ts`
   - Before fix: `preserve-conflict / missing-baseline / winner: crdt` (user edit demoted)
   - After fix: `preserve-conflict / missing-baseline / winner: disk` (user edit wins main file)
 - Fix: `src/sync/closedFileConflict.ts` — missing-baseline now uses mtime evidence:
@@ -126,7 +126,7 @@ Repo-validated bug / incident ledger as of 2026-05-27.
 - Real-device evidence:
   - `~/temenos/.obsidian/plugins/yaos/flight-logs/2026-05-27/boot-wL7i012vR4mGXA-1.ndjson`
   - pathId `p:476818d2ecba90d4e95e2a0c4f3ad1eb`
-  - timeline reproducible locally via `qa/scripts/issue22b-loop-summary.mjs`
+  - timeline reproducible locally via `qa/repros/issue22b-loop-summary.ts`
 - Fix:
   - `OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000ms`. New idle guard added to
     the localOnly branch, symmetric to the crdtOnly branch's existing 1200ms
