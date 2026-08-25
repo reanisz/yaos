@@ -83,6 +83,58 @@ When set, connections using `?token=` are rejected with 401 before the vault Dur
 
 The `wrangler.toml` included with the server contains this setting as a commented-out example with upgrade guidance.
 
+## Per-vault access tokens
+
+One server-wide token is the right shape for one operator syncing their own vaults. It is the wrong shape the moment a deployment hosts vaults across more than one trust boundary: the single token opens every vault, so handing it to another person — or to a device you only half trust — hands over all of them. Rotating it after a leak means re-onboarding every client.
+
+A **vault token** is scoped to exactly one `vaultId`. It authorizes that vault's HTTP routes, its ticket issuance and its sync socket, and nothing else.
+
+### Scope model
+
+| Credential | Opens | Can manage tokens |
+| --- | --- | --- |
+| Global token (`SYNC_TOKEN`, or the claimed token) | every vault | yes |
+| Vault token | its own `vaultId` only | no |
+
+The global token keeps opening everything, so a deployment that never calls the API below behaves exactly as it did before this feature existed — `vaultTokens` is simply an empty map, and a config written before the key existed reads as one.
+
+The operator API authenticates with the **global** token specifically. A vault token calling it gets 401, including when it targets its own vault: a credential that can mint or revoke credentials is not scoped, whatever its nominal scope says. `POST /api/update-metadata` and the private update metadata in `GET /api/capabilities` stay operator-only for the same reason.
+
+### API
+
+All three routes take `Authorization: Bearer <global-token>`.
+
+```
+GET  /api/vault-tokens
+  → { ok: true, vaultTokens: [ { vaultId, label, createdAt } ] }
+
+POST /api/vault-tokens          { vaultId, label? }
+  → { ok: true, vaultId, token, label, createdAt, obsidianUrl }
+
+POST /api/vault-tokens/revoke   { vaultId }
+  → { ok: true, existed: boolean }
+```
+
+The server generates the token itself — 32 bytes from `crypto.getRandomValues`, base64url — and stores only its SHA-256, the same way the global claim does. **The plaintext is in the issue response and nowhere else**: it is never logged, never re-readable, and the listing endpoint never returns a hash either. `obsidianUrl` is the usual `obsidian://yaos?action=setup&host=…&token=…&vaultId=…` deep link, so onboarding a second vault is still one click.
+
+`vaultId` is 8–256 characters after trimming; `label` is an optional human note of at most 64 characters. A server holds at most 100 vault tokens: the map is carried inside every cached config, so it has to stay cheap on the auth path.
+
+### One token per vault, rotation by re-issue
+
+There is no token list per vault. Issuing for a `vaultId` that already has a token **replaces** it — that is the rotation path, and it is why the cap never blocks a rotation, only a genuinely new vault. The previous token stops working as soon as the config cache turns over.
+
+### Revocation propagates within the config cache TTL
+
+`getStoredServerConfigCached` caches the stored config for 60 seconds (`AUTH_CONFIG_CACHE_TTL_MS`) to keep claim mode from paying a Durable Object round-trip per request. A mutation invalidates the cache in the isolate that served it, so the operator sees the effect immediately; other isolates keep serving their cached copy until their own TTL expires.
+
+**A revoked token can therefore still be accepted for up to 60 seconds by isolates that have not re-read the config.** That is the same staleness window the global token's hash has always had, and it is the price of not re-reading the config DO on every request. If you need a hard cut, re-deploy the Worker — a new deployment starts with cold caches.
+
+### Env mode is global-token only
+
+Under `SYNC_TOKEN`, the operator API answers `409 { "error": "unsupported_in_env_mode" }` and vault tokens are not consulted during authorization.
+
+This is a deliberate limit. Env mode's defining property is that it makes **zero** Durable Object calls per request: the token comes from the environment and is compared in the Worker. The vault-token map lives in the config DO, so honouring it in env mode would mean putting a `YAOS_CONFIG` round-trip back on every authenticated request — reintroducing exactly the per-request DO amplification that issue #40 removed. Deployments that want per-vault tokens use the claim flow, which already pays for (and caches) that read.
+
 ## Planned hardening (post-current)
 
 - Replace `tokenHash`-as-signing-key with a random per-server ticket signing secret generated at claim time and stored in the Config DO.  This removes the promotion of the token verifier hash to signing authority.  Existing deployments would backfill lazily on next claim.

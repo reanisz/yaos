@@ -1,5 +1,5 @@
 import { getServerByName } from "partyserver";
-import { getSocketAuthToken, isAuthorized } from "./auth";
+import { getSocketAuthToken, isAuthorizedForVault } from "./auth";
 import { json, withCors } from "./http";
 import { fetchVaultSchemaVersion } from "./trace";
 import { verifyTicket } from "./ticket";
@@ -145,7 +145,9 @@ export async function authenticateSocketRequest(
 		return { ok: false, reason: "unauthorized" };
 	}
 
-	const tokenValid = await isAuthorized(authState, token);
+	// Vault-scoped: the room's own token opens it, as does the operator token.
+	// A token issued for a different vault does not.
+	const tokenValid = await isAuthorizedForVault(authState, token, vaultId);
 	return tokenValid
 		? { ok: true, method: "legacy-token" }
 		: { ok: false, reason: "unauthorized" };

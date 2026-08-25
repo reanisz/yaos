@@ -261,6 +261,7 @@ s.section("Test 8: public capabilities do not expose private update metadata");
 		updateProvider: "github" as const,
 		updateRepoUrl: "https://github.com/private/fork",
 		updateRepoBranch: "secret-branch",
+		vaultTokens: {},
 	};
 	const publicCaps = getCapabilities(auth, env, config);
 	s.check(publicCaps.maxBlobUploadBytes === MAX_BLOB_UPLOAD_BYTES, "capabilities expose the server blob upload cap");

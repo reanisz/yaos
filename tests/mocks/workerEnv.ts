@@ -168,6 +168,171 @@ export function makeStoredConfigNamespace(config: unknown): FakeConfigNamespace 
 }
 
 // ---------------------------------------------------------------------------
+// Durable Object state
+// ---------------------------------------------------------------------------
+
+/**
+ * In-memory key-value storage for a Durable Object, faithful on the three
+ * properties a test can actually observe:
+ *
+ *   1. Values round-trip through `structuredClone`, as they do through real
+ *      storage serialisation.  A fake that handed back the caller's own object
+ *      would hide an aliasing bug where a handler mutates what it "stored".
+ *   2. `transaction` rolls back every write when the closure throws.
+ *   3. An absent key reads as `undefined`, never as a default.
+ *
+ * One class implements both `DurableObjectStorage` and
+ * `DurableObjectTransaction` — their read/write halves are identical, and the
+ * transaction is handed `this` — so a test never has to keep two fakes in
+ * sync.  Members no config-DO path reaches (SQL, KV, alarms, bookmarks, list)
+ * are declared `never` and throw: `never` satisfies every signature for free,
+ * and a test that does reach one fails loudly instead of receiving
+ * `undefined`.
+ */
+export class FakeDurableObjectStorage implements DurableObjectStorage, DurableObjectTransaction {
+	private readonly entries = new Map<string, unknown>();
+
+	/** Keys currently stored, in insertion order — for asserting on writes. */
+	keys(): string[] {
+		return [...this.entries.keys()];
+	}
+
+	get<T = unknown>(key: string, options?: DurableObjectGetOptions): Promise<T | undefined>;
+	get<T = unknown>(keys: string[], options?: DurableObjectGetOptions): Promise<Map<string, T>>;
+	async get<T>(keyOrKeys: string | string[]): Promise<T | undefined | Map<string, T>> {
+		if (typeof keyOrKeys === "string") {
+			const value = this.entries.get(keyOrKeys);
+			return value === undefined ? undefined : structuredClone(value) as T;
+		}
+		const found = new Map<string, T>();
+		for (const key of keyOrKeys) {
+			const value = this.entries.get(key);
+			if (value !== undefined) found.set(key, structuredClone(value) as T);
+		}
+		return found;
+	}
+
+	put<T>(key: string, value: T, options?: DurableObjectPutOptions): Promise<void>;
+	put<T>(entries: Record<string, T>, options?: DurableObjectPutOptions): Promise<void>;
+	async put<T>(keyOrEntries: string | Record<string, T>, value?: T): Promise<void> {
+		if (typeof keyOrEntries === "string") {
+			this.entries.set(keyOrEntries, structuredClone(value));
+			return;
+		}
+		for (const [key, entry] of Object.entries(keyOrEntries)) {
+			this.entries.set(key, structuredClone(entry));
+		}
+	}
+
+	delete(key: string, options?: DurableObjectPutOptions): Promise<boolean>;
+	delete(keys: string[], options?: DurableObjectPutOptions): Promise<number>;
+	async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
+		if (typeof keyOrKeys === "string") {
+			return this.entries.delete(keyOrKeys);
+		}
+		let deleted = 0;
+		for (const key of keyOrKeys) {
+			if (this.entries.delete(key)) deleted++;
+		}
+		return deleted;
+	}
+
+	async deleteAll(): Promise<void> {
+		this.entries.clear();
+	}
+
+	async transaction<T>(closure: (txn: DurableObjectTransaction) => Promise<T>): Promise<T> {
+		const snapshot = new Map(this.entries);
+		try {
+			return await closure(this);
+		} catch (error) {
+			this.entries.clear();
+			for (const [key, value] of snapshot) this.entries.set(key, value);
+			throw error;
+		}
+	}
+
+	/** Real transactions abort the closure; nothing under test calls this. */
+	rollback(): never {
+		throw new Error("FakeDurableObjectStorage: rollback() is not implemented");
+	}
+
+	async sync(): Promise<void> {}
+
+	get sql(): never {
+		throw new Error("FakeDurableObjectStorage: sql is not implemented");
+	}
+
+	get kv(): never {
+		throw new Error("FakeDurableObjectStorage: kv is not implemented");
+	}
+
+	list(): never {
+		throw new Error("FakeDurableObjectStorage: list() is not implemented");
+	}
+
+	transactionSync(): never {
+		throw new Error("FakeDurableObjectStorage: transactionSync() is not implemented");
+	}
+
+	getAlarm(): never {
+		throw new Error("FakeDurableObjectStorage: getAlarm() is not implemented");
+	}
+
+	setAlarm(): never {
+		throw new Error("FakeDurableObjectStorage: setAlarm() is not implemented");
+	}
+
+	deleteAlarm(): never {
+		throw new Error("FakeDurableObjectStorage: deleteAlarm() is not implemented");
+	}
+
+	getCurrentBookmark(): never {
+		throw new Error("FakeDurableObjectStorage: getCurrentBookmark() is not implemented");
+	}
+
+	getBookmarkForTime(): never {
+		throw new Error("FakeDurableObjectStorage: getBookmarkForTime() is not implemented");
+	}
+
+	onNextSessionRestoreBookmark(): never {
+		throw new Error("FakeDurableObjectStorage: onNextSessionRestoreBookmark() is not implemented");
+	}
+}
+
+/**
+ * A `DurableObjectState` over `storage`, enough to construct a real Durable
+ * Object class and drive it through `fetch`.
+ *
+ * The WebSocket-hibernation members throw: a config DO never touches them, and
+ * a silent no-op would let a future one appear to work.
+ */
+export function makeDurableObjectState(
+	storage: DurableObjectStorage,
+	name = "global-config",
+): DurableObjectState {
+	const unimplemented = (member: string) => (): never => {
+		throw new Error(`makeDurableObjectState: ${member} is not implemented`);
+	};
+	return {
+		props: undefined,
+		id: makeDurableObjectId(name),
+		storage,
+		waitUntil: (_promise: Promise<unknown>): void => {},
+		blockConcurrencyWhile: async <T>(callback: () => Promise<T>): Promise<T> => await callback(),
+		acceptWebSocket: unimplemented("acceptWebSocket"),
+		getWebSockets: unimplemented("getWebSockets"),
+		setWebSocketAutoResponse: unimplemented("setWebSocketAutoResponse"),
+		getWebSocketAutoResponse: unimplemented("getWebSocketAutoResponse"),
+		getWebSocketAutoResponseTimestamp: unimplemented("getWebSocketAutoResponseTimestamp"),
+		setHibernatableWebSocketEventTimeout: unimplemented("setHibernatableWebSocketEventTimeout"),
+		getHibernatableWebSocketEventTimeout: unimplemented("getHibernatableWebSocketEventTimeout"),
+		getTags: unimplemented("getTags"),
+		abort: unimplemented("abort"),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // R2
 // ---------------------------------------------------------------------------
 

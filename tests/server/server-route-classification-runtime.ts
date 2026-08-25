@@ -185,6 +185,27 @@ s.section("Test 4: unclaimed mode — vault routes rejected without YAOS_SYNC ac
 	s.check(resp.status === 503, "unclaimed mode: vault route returns 503");
 	s.check(syncTrap.touched.length === 0, "unclaimed mode: YAOS_SYNC was not touched");
 
+	// The positive half of the classifier invariant for the vault-token API:
+	// the three valid shapes reach auth (503 here, not the 404 the invalid
+	// shapes in Test 5 get) and none of them touches YAOS_SYNC.
+	const vaultTokenRoutes: Array<[string, string]> = [
+		["GET", "/api/vault-tokens"],
+		["POST", "/api/vault-tokens"],
+		["POST", "/api/vault-tokens/revoke"],
+	];
+	for (const [method, path] of vaultTokenRoutes) {
+		const routed = await worker.fetch(
+			new Request(`https://example.com${path}`, {
+				method,
+				headers: { "Content-Type": "application/json" },
+				body: method === "POST" ? JSON.stringify({ vaultId: "vault-alpha-0001" }) : undefined,
+			}),
+			trapSyncEnv,
+		);
+		s.check(routed.status === 503, `${method} ${path}: reaches auth in unclaimed mode (503, not 404)`);
+	}
+	s.check(syncTrap.touched.length === 0, "vault-token API: YAOS_SYNC was not touched");
+
 	invalidateStoredServerConfigCache();
 }
 
@@ -205,6 +226,13 @@ s.section("Test 5: valid resource + invalid shape returns 404 without YAOS_CONFI
 		["DELETE", "/vault/foo/blobs/somehash"],    // blobs doesn't handle DELETE
 		["POST", "/vault/foo/auth/ticket/extra"],   // extra path segments
 		["GET",  "/api/not-real"],                  // API-shaped but unknown endpoint
+		// Per-vault token operator API: exact method+pathname pairs only.
+		["DELETE", "/api/vault-tokens"],            // list/issue are GET/POST
+		["PUT",  "/api/vault-tokens"],              // ditto
+		["GET",  "/api/vault-tokens/revoke"],       // revoke is POST-only
+		["POST", "/api/vault-tokens/extra/seg"],    // extra path segments
+		["POST", "/api/vault-tokens/"],             // trailing slash is a different path
+		["GET",  "/api/vault-tokens-extra"],        // prefix-shaped but unknown endpoint
 	];
 
 	for (const [method, path] of invalidShapePaths) {

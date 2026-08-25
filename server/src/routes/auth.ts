@@ -180,6 +180,38 @@ export async function isAuthorized(
 	return false;
 }
 
+/**
+ * Authorization for a single vault's routes.
+ *
+ * Two credentials open a vault: the server-wide operator token (which opens
+ * every vault, and is the only credential that existed before per-vault
+ * tokens), or the token issued for exactly this vaultId.  A per-vault token
+ * authorizes nothing else — not another vault, not the operator API.
+ *
+ * Env mode recognises the global token only.  That is a deliberate limit, not
+ * an oversight: env mode makes zero Durable Object calls per request, and the
+ * vault-token map lives in the config DO, so honouring it here would put a
+ * YAOS_CONFIG round-trip back on every request.  See
+ * docs/architecture/zero-config-auth.md.
+ */
+export async function isAuthorizedForVault(
+	state: AuthState,
+	token: string | null,
+	vaultId: string,
+): Promise<boolean> {
+	if (await isAuthorized(state, token)) return true;
+	if (!token || state.mode !== "claim") return false;
+
+	// Claim-mode states built by getAuthStateCached always carry the config;
+	// the optional chain covers the uncached getAuthState variant, which has no
+	// vault-token map to consult and therefore authorizes the global token only.
+	const record = state.config?.vaultTokens?.[vaultId];
+	if (!record || typeof record.tokenHash !== "string" || record.tokenHash.length === 0) {
+		return false;
+	}
+	return (await hashToken(token)) === record.tokenHash;
+}
+
 export type PreAuthRejectionReason = "unclaimed" | "server_misconfigured" | "unauthorized";
 
 /** Typed rejection result — carries both the HTTP response and the reason for logging. */
@@ -199,7 +231,7 @@ export async function rejectUnauthorizedVaultRequest(
 	req: Request,
 	_env: unknown,
 	authState: AuthState,
-	_vaultId: string,
+	vaultId: string,
 ): Promise<AuthRejection | null> {
 	const token = getHttpAuthToken(req);
 	if (!authState.claimed) {
@@ -208,13 +240,13 @@ export async function rejectUnauthorizedVaultRequest(
 	if (authState.mode === "env" && !authState.envToken) {
 		return { response: json({ error: "server_misconfigured" }, 503), reason: "server_misconfigured" };
 	}
-	if (!(await isAuthorized(authState, token))) {
+	if (!(await isAuthorizedForVault(authState, token, vaultId))) {
 		return { response: json({ error: "unauthorized" }, 401), reason: "unauthorized" };
 	}
 	return null;
 }
 
-function buildObsidianSetupUrl(host: string, token: string, vaultId?: string): string {
+export function buildObsidianSetupUrl(host: string, token: string, vaultId?: string): string {
 	const params = new URLSearchParams({
 		action: "setup",
 		host,

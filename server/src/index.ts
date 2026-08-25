@@ -19,6 +19,7 @@ import { handleSnapshotRoute } from "./routes/snapshots";
 import { handleSyncSocketRoute, parseSyncPath } from "./routes/syncSocket";
 import { handleTicketRoute } from "./routes/ticket";
 import { fetchVaultDebug, fetchVaultDocument, recordVaultTrace, compactVault } from "./routes/trace";
+import { handleVaultTokensRoute, type VaultTokensAction } from "./routes/vaultTokens";
 import type { AuthState, AuthStateCached, Env } from "./routes/types";
 
 const LOG_PREFIX = "[yaos-sync:worker]";
@@ -44,6 +45,7 @@ type WorkerRoute =
 	| { kind: "capabilities" }
 	| { kind: "claim" }
 	| { kind: "update-metadata" }
+	| { kind: "vault-tokens"; action: VaultTokensAction }
 	| { kind: "sync-socket"; vaultId: string }
 	| { kind: "vault"; vaultId: string; resource: string; rest: string[] }
 	| { kind: "not-found" };
@@ -77,6 +79,11 @@ const VALID_VAULT_RESOURCES = new Set(["auth", "debug", "blobs", "snapshots"]);
 //   4. Add a trap-env test to tests/server/server-route-classification-runtime.ts
 //      asserting that the valid shape reaches auth and the invalid shapes
 //      (wrong method, unknown subpath) still return 404 without DO access
+//
+// The same four steps apply to a new /api/* route, with (2) and (3) collapsing
+// into one: classifyWorkerRoute matches those on an exact method + pathname
+// pair, so every unlisted method and every extra path segment falls through to
+// not-found on its own — which the step (4) test must still prove.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -188,6 +195,20 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 		return { kind: "update-metadata" };
 	}
 
+	// Per-vault token operator API.  Exact pathnames only: DELETE
+	// /api/vault-tokens, GET /api/vault-tokens/revoke and
+	// /api/vault-tokens/anything/else all fall through to not-found below,
+	// before any YAOS_CONFIG access.
+	if (url.pathname === "/api/vault-tokens") {
+		if (req.method === "GET") return { kind: "vault-tokens", action: "list" };
+		if (req.method === "POST") return { kind: "vault-tokens", action: "issue" };
+		return { kind: "not-found" };
+	}
+
+	if (req.method === "POST" && url.pathname === "/api/vault-tokens/revoke") {
+		return { kind: "vault-tokens", action: "revoke" };
+	}
+
 	// parseSyncPath MUST run before parseVaultPath.  /vault/sync/:vaultId
 	// would otherwise be misread as vaultId="sync", resource=:vaultId and then
 	// rejected by the resource whitelist as not-found.
@@ -231,6 +252,7 @@ function routeBucket(route: WorkerRoute): string {
 		case "capabilities": return "api_capabilities";
 		case "claim": return "claim";
 		case "update-metadata": return "api_update_metadata";
+		case "vault-tokens": return `api_vault_tokens_${route.action}`;
 		case "sync-socket": return "vault_sync";
 		case "vault": return `vault_${route.resource}`;
 		case "not-found": return "not_found";
@@ -395,6 +417,8 @@ const worker = {
 			response = await handleClaimRoute(req, env, authState);
 		} else if (route.kind === "update-metadata") {
 			response = withCors(await handleUpdateMetadataRoute(req, env, authState));
+		} else if (route.kind === "vault-tokens") {
+			response = withCors(await handleVaultTokensRoute(req, env, authState, route.action));
 		} else if (route.kind === "sync-socket") {
 			response = await handleSyncSocketRoute(req, env, authState, route.vaultId);
 		} else {
