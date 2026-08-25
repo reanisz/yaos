@@ -49,6 +49,16 @@ export default tseslint.config(
 				tsconfigRootDir: import.meta.dirname,
 			},
 		},
+		rules: {
+			// The obsidianmd preset restricts `fetch` because inside an Obsidian
+			// plugin the right call is requestUrl(), which sidesteps CORS and the
+			// desktop/mobile split.  server/src is not a plugin: it is a Cloudflare
+			// Worker, where requestUrl does not exist and global fetch IS the
+			// platform API — for outbound calls and for the handler signature
+			// alike.  Left on, the rule can only ever be a false positive here.
+			// Scoped to this one rule so every other worker restriction stands.
+			"no-restricted-globals": "off",
+		},
 	},
 	{
 		files: ["server/tests/**/*.ts"],
