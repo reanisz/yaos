@@ -171,6 +171,7 @@ const workspace = new EditorWorkspaceOrchestrator({
 	getSettings: () => ({ deviceName: "closure-test" }) as never,
 	getEditorBindings: () => editorBindings as never,
 	getDiskMirror: () => diskMirror as never,
+	isMarkdownPathSyncable: () => true,
 	maybeImportDeferredClosedOnlyPath: (candidatePath, reason) => {
 		lifecycleOrder.push(`deferImport:${reason}`);
 		controller.maybeImportDeferredClosedOnlyPath(candidatePath, reason);

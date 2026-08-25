@@ -405,6 +405,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getSettings: () => this.settings,
 			getEditorBindings: () => this.editorBindings,
 			getDiskMirror: () => this.diskMirror,
+			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			maybeImportDeferredClosedOnlyPath: (path, reason) =>
 				this.reconciliationController.maybeImportDeferredClosedOnlyPath(path, reason),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
@@ -764,6 +765,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(source, msg, details) => this.trace(source, msg, details),
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
+				(path) => this.isMarkdownPathSyncable(path),
 			);
 
 			// 3. Global CM6 extension.
@@ -2104,6 +2106,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
+		// Sole assignment site for excludePatterns, and every path that can change
+		// the setting funnels through here — so re-applying scope to the open
+		// editors from this one place is complete by construction. Optional
+		// chaining because the first call (load-settings) runs before the
+		// orchestrator exists.
+		this.editorWorkspace?.onSyncScopeChanged(reason);
 		this.applyCursorVisibility();
 		void this.refreshFlightTraceState(reason);
 		this.trace("trace", "runtime-settings-applied", {
