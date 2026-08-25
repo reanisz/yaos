@@ -701,6 +701,36 @@ export class EditorBindingManager {
 	}
 
 	/**
+	 * True when attaching yCollab to this view cannot corrupt the shared
+	 * document — i.e. the editor buffer already agrees with the `Y.Text`, or
+	 * there is no `Y.Text` yet so binding will seed one from the buffer.
+	 *
+	 * y-codemirror performs NO initial sync: `YSyncPluginValue`'s constructor
+	 * only registers an observer, and `update()` maps editor change offsets
+	 * straight into the `Y.Text` (`ytext.insert(fromA + adj, …)`). Bind onto a
+	 * buffer that does not match and the user's next keystroke writes at a
+	 * semantically wrong offset, or throws `Length exceeded!` from inside the
+	 * CodeMirror update cycle — either way the corruption replicates.
+	 *
+	 * Nothing checks this today: `bind()` never compares, and
+	 * `inspectBindingHealth` verifies facet identity and awareness, never
+	 * content. The one method that would reconcile the two, `heal()`, has no
+	 * production caller.
+	 *
+	 * Callers that can encounter a genuinely diverged pair should decline to
+	 * bind and let reconcile's closed-file planner arbitrate, rather than pick
+	 * a winner here — both sides may hold real content, and silently choosing
+	 * the editor is how the CRDT loses remote edits with no artifact.
+	 */
+	canBindWithoutDivergence(view: MarkdownView): boolean {
+		const file = view.file;
+		if (!file) return false;
+		const ytext = this.vaultSync.getTextForPath(file.path);
+		if (!ytext) return true;
+		return ytext.toJSON() === view.editor.getValue();
+	}
+
+	/**
 	 * Update binding metadata after a batch rename. If any bound editor's
 	 * tracked path was renamed, update the tracking. The yCollab binding
 	 * itself doesn't need to change (stable file IDs), but our bookkeeping does.

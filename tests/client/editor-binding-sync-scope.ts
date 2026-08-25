@@ -299,6 +299,8 @@ s.section("Test 7: onSyncScopeChanged — an already-bound view unbinds when it 
 	let scope: (path: string) => boolean = () => true;
 
 	const boundPaths = new Set([EXCLUDED, IN_SCOPE]);
+	/** Paths whose editor buffer no longer matches the CRDT. */
+	const diverged = new Set<string>();
 	const editorBindings = partialOf<EditorBindingManager>({
 		isBound: (path: string) => boundPaths.has(path),
 		// Per-LEAF probe: onSyncScopeChanged uses this rather than the path-keyed
@@ -310,6 +312,7 @@ s.section("Test 7: onSyncScopeChanged — an already-bound view unbinds when it 
 			settling: false,
 			issues: [],
 		}),
+		canBindWithoutDivergence: (view: MarkdownView) => !diverged.has(view.file?.path ?? "?"),
 		unbindByPath: (path: string) => { unbound.push(path); boundPaths.delete(path); },
 		bind: (view: MarkdownView) => {
 			const p = view.file?.path ?? "?";
@@ -352,6 +355,75 @@ s.section("Test 7: onSyncScopeChanged — an already-bound view unbinds when it 
 	scope = () => true;
 	orchestrator.onSyncScopeChanged("settings-change");
 	eq(bound, [EXCLUDED], "re-including the path rebinds the still-open view");
+}
+
+// ── Test 8: re-inclusion refuses to bind a diverged buffer ─────────────────
+
+s.section("Test 8: onSyncScopeChanged — a diverged buffer is left unbound, not bound");
+{
+	// y-codemirror does NO initial sync: binding maps the next keystroke's
+	// offset straight into the Y.Text. While a path was excluded the user could
+	// edit the buffer while the CRDT kept taking remote edits, with nothing
+	// reconciling them — so re-inclusion is the one bind site that routinely
+	// meets a diverged pair. Binding there would corrupt the shared document
+	// for every device.
+	const bound: string[] = [];
+	const logs: string[] = [];
+	const boundPaths = new Set<string>();
+	const divergedPaths = new Set([EXCLUDED]);
+
+	const editorBindings = partialOf<EditorBindingManager>({
+		isBound: (path: string) => boundPaths.has(path),
+		getBindingHealthForView: (view: MarkdownView) => ({
+			bound: boundPaths.has(view.file?.path ?? "?"),
+			healthy: true,
+			settling: false,
+			issues: [],
+		}),
+		canBindWithoutDivergence: (view: MarkdownView) => !divergedPaths.has(view.file?.path ?? "?"),
+		unbindByPath: () => {},
+		bind: (view: MarkdownView) => {
+			const p = view.file?.path ?? "?";
+			bound.push(p);
+			boundPaths.add(p);
+		},
+	});
+
+	const leaves = [EXCLUDED, IN_SCOPE].map((path) =>
+		partialOf<WorkspaceLeaf>({
+			view: Object.assign(Object.create(MarkdownView.prototype) as MarkdownView, {
+				file: partialOf<TFile>({ path }),
+			}),
+		}),
+	);
+
+	const orchestrator = new EditorWorkspaceOrchestrator({
+		app: partialOf<import("obsidian").App>({
+			workspace: partialOf<Workspace>({
+				iterateAllLeaves: (cb: (leaf: WorkspaceLeaf) => void) => { leaves.forEach(cb); },
+			}),
+		}),
+		getSettings: () => partialOf<VaultSyncSettings>({ deviceName: "device" }),
+		getEditorBindings: () => editorBindings,
+		getDiskMirror: () => null as DiskMirror | null,
+		// Everything is back in scope — this is the re-inclusion sweep.
+		isMarkdownPathSyncable: () => true,
+		maybeImportDeferredClosedOnlyPath: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: (message: string) => { logs.push(message); },
+	});
+
+	orchestrator.onSyncScopeChanged("settings-change");
+
+	eq(bound, [IN_SCOPE], "the diverged view is NOT bound; the agreeing one is");
+	s.check(
+		logs.some((l) => l.includes(EXCLUDED) && l.includes("diverged")),
+		`the refusal is logged against the path (logs: ${JSON.stringify(logs)})`,
+	);
+	s.check(
+		logs.some((l) => l.includes("diverged 1")),
+		"the sweep summary reports it separately from bound/unbound",
+	);
 }
 
 await s.done();

@@ -200,6 +200,7 @@ export class EditorWorkspaceOrchestrator {
 
 		let unbound = 0;
 		let bound = 0;
+		let skipped = 0;
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
 			if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) return;
 			const path = leaf.view.file.path;
@@ -224,6 +225,25 @@ export class EditorWorkspaceOrchestrator {
 			// unbound.
 			if (editorBindings.getBindingHealthForView(leaf.view)?.bound) return;
 
+			// Re-inclusion is the one bind site that routinely meets a diverged
+			// pair, and it is diverged BECAUSE of the scope guards: while the path
+			// was excluded the user edited the buffer and the CRDT kept taking
+			// remote edits, with nothing reconciling them. y-codemirror does no
+			// initial sync, so binding here would map the next keystroke onto the
+			// wrong offset in the shared document.
+			//
+			// Decline instead of picking a winner. Left unbound the file behaves
+			// as a normal local file, and because it is unbound reconcile's
+			// closed-file planner will see it and run the three-way decision that
+			// preserves both sides as a conflict artifact.
+			if (!editorBindings.canBindWithoutDivergence(leaf.view)) {
+				skipped += 1;
+				this.deps.log(
+					`Sync scope changed (${reason}) — "${path}" left unbound: editor and CRDT diverged while it was excluded`,
+				);
+				return;
+			}
+
 			this.bindView(leaf.view);
 
 			// Count only if the bind actually took. bind() legitimately refuses
@@ -238,9 +258,9 @@ export class EditorWorkspaceOrchestrator {
 			}
 		});
 
-		if (unbound > 0 || bound > 0) {
+		if (unbound > 0 || bound > 0 || skipped > 0) {
 			this.deps.log(
-				`Sync scope changed (${reason}) — unbound ${unbound}, bound ${bound}`,
+				`Sync scope changed (${reason}) — unbound ${unbound}, bound ${bound}, diverged ${skipped}`,
 			);
 			this.deps.scheduleTraceStateSnapshot(`sync-scope-changed:${reason}`);
 		}
