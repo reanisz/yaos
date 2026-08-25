@@ -426,4 +426,48 @@ s.section("Test 8: onSyncScopeChanged — a diverged buffer is left unbound, not
 	);
 }
 
+// ── Test 9: canBindWithoutDivergence itself ────────────────────────────────
+
+s.section("Test 9: canBindWithoutDivergence — the real implementation, not a stub");
+{
+	// Test 8 above drives the orchestrator against a STUBBED predicate, so it
+	// pins the orchestrator's use of it and nothing about the implementation.
+	// Review caught that gap: an implementation that always returned true would
+	// pass every other test here while re-opening the corruption it exists to
+	// prevent — y-codemirror does no initial sync, so binding onto a mismatched
+	// buffer maps the next keystroke to a wrong offset in the shared document.
+	const h = makeHarness({ existing: [IN_SCOPE] });
+	const ytext = h.texts.get(IN_SCOPE);
+	if (!ytext) throw new Error("fixture: expected a seeded Y.Text");
+	ytext.insert(0, "shared content");
+
+	s.check(
+		h.manager.canBindWithoutDivergence(makeView(IN_SCOPE, "shared content")),
+		"buffer matching the Y.Text is safe to bind",
+	);
+	s.check(
+		!h.manager.canBindWithoutDivergence(makeView(IN_SCOPE, "shared content plus local edits")),
+		"buffer diverged from the Y.Text is NOT safe to bind",
+	);
+	s.check(
+		!h.manager.canBindWithoutDivergence(makeView(IN_SCOPE, "")),
+		"an empty buffer against a non-empty Y.Text is divergence, not a fresh file",
+	);
+
+	// No Y.Text yet: binding will seed one FROM the buffer, so there is nothing
+	// to diverge from. Returning false here would refuse every first open.
+	s.check(
+		h.manager.canBindWithoutDivergence(makeView("notes/brand-new.md", "typed just now")),
+		"a path with no Y.Text is safe — binding seeds it from the buffer",
+	);
+
+	// A detached view has no path to compare, so it cannot be judged safe.
+	s.check(
+		!h.manager.canBindWithoutDivergence(partialOf<MarkdownView>({ file: null })),
+		"a view with no file is not safe to bind",
+	);
+
+	h.doc.destroy();
+}
+
 await s.done();
