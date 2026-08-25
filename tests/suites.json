@@ -12,6 +12,7 @@
 		"tests/live/hardening-worker.ts": "Live-worker suite. Spawned by tests/live/run-live.ts; needs a running server and SYNC_TOKEN.",
 		"tests/live/ws-ticket-reconnect.ts": "Live-worker suite. Spawned by tests/live/run-live.ts, which starts the server with YAOS_TICKET_TTL_MS:8000 so post-expiry reconnect is reachable in seconds.",
 		"tests/live/ws-admission-protocol.ts": "Live-worker suite. Spawned by tests/live/run-live.ts; needs a running server and SYNC_TOKEN.",
+		"tests/live/vault-tokens-live.ts": "Live-worker suite. Spawned by tests/live/run-live.ts phase 2, which boots a second wrangler dev with SYNC_TOKEN removed; needs an UNCLAIMED server, which it claims itself before minting the per-vault tokens it exercises.",
 		"tests/live/live-seed-check.ts": "Manual probe against a deployed server. Throws unless YAOS_TEST_HOST, SYNC_TOKEN, and YAOS_TEST_VAULT_ID are all set.",
 		"tests/live/persistence-handoff-proof.ts": "Issue #24 RCA experiment against a live server. Throws without SYNC_TOKEN; two-device handoff over real WebSockets.",
 		"tests/live/persistence-eviction-proof.ts": "Issue #24 RCA experiment. Defaults YAOS_TEST_HOST to a real deployment URL and sleeps 160s waiting for Durable Object eviction — far too slow and too external for the regression gate."
