@@ -233,6 +233,18 @@ s.section("Test 5: valid resource + invalid shape returns 404 without YAOS_CONFI
 		["POST", "/api/vault-tokens/extra/seg"],    // extra path segments
 		["POST", "/api/vault-tokens/"],             // trailing slash is a different path
 		["GET",  "/api/vault-tokens-extra"],        // prefix-shaped but unknown endpoint
+		// Access-gated admin surface.  This env sets neither Access variable, so
+		// EVERY admin path is a junk path here (Test 1 covers "/admin" itself);
+		// these are the shapes that must 404 even where Access IS configured,
+		// which Test 7 below proves separately.
+		["GET",  "/admin/api/vault-tokens/extra"],  // extra path segments
+		["DELETE", "/admin"],                       // the page is GET-only
+		["POST", "/admin"],                         // ditto
+		["GET",  "/admin/api/vault-tokens/revoke"], // revoke is POST-only
+		["DELETE", "/admin/api/vault-tokens"],      // list/issue are GET/POST
+		["OPTIONS", "/admin/api/vault-tokens"],     // no CORS preflight arm, by design
+		["GET",  "/admin/"],                        // trailing slash is a different path
+		["GET",  "/admin-extra"],                   // prefix-shaped but unknown endpoint
 	];
 
 	for (const [method, path] of invalidShapePaths) {
@@ -302,5 +314,56 @@ s.section("Test 6: /vault/sync/:vaultId is classified as sync-socket, not vault"
 		resp.status === 426 || resp.status === 401 || resp.status === 503,
 		`/vault/sync/:vaultId reaches the sync handler (status ${resp.status}, not 404)`,
 	);
+}
+
+// ── Test 7: admin shapes are classified before Access is consulted ────────────
+//
+// Test 5 proves the invalid admin shapes 404 on a deployment without Access.
+// That alone would also be satisfied by a build where the 404 came from the
+// Access check rather than the classifier — and such a build would answer 401
+// (or worse, dispatch) for DELETE /admin/api/vault-tokens once an operator
+// turned Access on.  Here Access IS configured, so the two causes separate:
+// an invalid shape must still be 404, while the valid shape must reach the
+// admin handler and be refused for lack of a token.  Both namespaces stay
+// traps: neither outcome may touch a Durable Object.
+s.section("Test 7: with Access configured, invalid admin shapes still 404 before the handler");
+{
+	const accessEnv: Env = makeEnv({
+		SYNC_TOKEN: undefined,
+		YAOS_ACCESS_TEAM_DOMAIN: "myteam.cloudflareaccess.com",
+		YAOS_ACCESS_AUD: "0123456789abcdef".repeat(4),
+		YAOS_SYNC: makeTrapNamespace(DO_TOUCHED),
+		YAOS_CONFIG: makeTrapNamespace(DO_TOUCHED),
+	});
+
+	const invalidAdminShapes: Array<[string, string]> = [
+		["DELETE", "/admin"],
+		["POST", "/admin"],
+		["GET", "/admin/"],
+		["GET", "/admin/foo"],
+		["DELETE", "/admin/api/vault-tokens"],
+		["GET", "/admin/api/vault-tokens/extra"],
+		["GET", "/admin/api/vault-tokens/revoke"],
+		["OPTIONS", "/admin/api/vault-tokens"],
+	];
+
+	for (const [method, path] of invalidAdminShapes) {
+		let threw = false;
+		let status = 0;
+		try {
+			const resp = await worker.fetch(new Request(`https://example.com${path}`, { method }), accessEnv);
+			status = resp.status;
+		} catch (err) {
+			threw = true;
+			console.error(`  ERROR ${method} ${path}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		s.check(!threw, `${method} ${path}: did not throw (DO namespace not touched)`);
+		s.check(status === 404, `${method} ${path}: status is 404 even with Access configured`);
+	}
+
+	// The contrast: a valid shape IS recognised, and is refused by the Access
+	// gate rather than by the classifier — still without any DO access.
+	const recognised = await worker.fetch(new Request("https://example.com/admin"), accessEnv);
+	s.check(recognised.status === 401, `GET /admin with Access configured reaches the admin gate (status ${recognised.status})`);
 }
 await s.done();

@@ -31,6 +31,30 @@ export interface Env {
 	 * non-empty value enables it.
 	 */
 	YAOS_ENABLE_ADMIN_ROUTES?: string;
+	/**
+	 * Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com" (a bare
+	 * "myteam" and a full https:// URL are both accepted and normalized).
+	 *
+	 * Setting this AND YAOS_ACCESS_AUD enables the /admin page and its JSON API;
+	 * with either missing or malformed, every /admin path answers the ordinary
+	 * 404 and no Durable Object is touched.  Requires the Worker to be served on
+	 * a custom domain in your zone: Access protects hostnames, and it cannot be
+	 * put in front of a workers.dev URL.
+	 *
+	 * The Worker verifies the Access JWT itself (signature, issuer, audience)
+	 * rather than trusting the Cf-Access-Jwt-Assertion header, so a request that
+	 * reaches the same script directly on workers.dev — where Access never ran —
+	 * is refused.  See server/src/accessJwt.ts.
+	 */
+	YAOS_ACCESS_TEAM_DOMAIN?: string;
+	/**
+	 * The AUD tag of the Cloudflare Access application protecting /admin: 64 hex
+	 * characters, copied from the application's overview page.  Scopes admin to
+	 * one specific Access application — a valid token minted for a different
+	 * application in the same team is rejected.  Enables /admin only in
+	 * combination with YAOS_ACCESS_TEAM_DOMAIN.
+	 */
+	YAOS_ACCESS_AUD?: string;
 }
 
 export type JsonResponse = (body: unknown, status?: number) => Response;

@@ -26,6 +26,14 @@ import {
 	type AccessConfig,
 	type AccessJwtResult,
 } from "../../server/src/accessJwt";
+import {
+	accessJwksDocument,
+	encodeJwtSegment,
+	signAccessJwt,
+	TEST_ACCESS_AUD,
+	TEST_ACCESS_KID,
+	TEST_ACCESS_TEAM_DOMAIN,
+} from "../mocks/accessJwt.ts";
 import { bytesToBase64Url } from "../../server/src/base64url";
 import { suite } from "../harness.ts";
 
@@ -47,10 +55,10 @@ function reasonOf(result: AccessJwtResult): string {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const TEAM_DOMAIN = "myteam.cloudflareaccess.com";
+const TEAM_DOMAIN = TEST_ACCESS_TEAM_DOMAIN;
 const ISS = `https://${TEAM_DOMAIN}`;
 /** A syntactically real Access AUD tag: 64 hex chars. */
-const AUD = "0123456789abcdef".repeat(4);
+const AUD = TEST_ACCESS_AUD;
 
 /** Frozen clock. Every token below is dated relative to this instant. */
 const NOW = Date.UTC(2026, 7, 26, 12, 0, 0);
@@ -70,25 +78,14 @@ function requireConfig(teamDomain: string, aud: string): AccessConfig {
 
 const CONFIG = requireConfig(TEAM_DOMAIN, AUD);
 
-const keyPair = await crypto.subtle.generateKey(
-	{ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) },
-	true,
-	["sign", "verify"],
-);
-if (!("privateKey" in keyPair)) throw new Error("test setup: expected an RSA key pair");
-const publicJwk = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
-
-const PRIMARY_KID = "access-key-1";
+// Keypair, JWKS document and RS256 signer come from tests/mocks/accessJwt.ts,
+// which tests/server/admin-routes.ts shares — one definition of "a valid Access
+// token" for the verifier tests and the whole-Worker tests alike.
+const PRIMARY_KID = TEST_ACCESS_KID;
 const ROTATED_KID = "access-key-2";
 
-/** A JWKS document publishing the one real public key under `kid`. */
-function jwksDoc(...kids: readonly string[]): unknown {
-	return { keys: kids.map((kid) => ({ ...publicJwk, kid, alg: "RS256", use: "sig" })) };
-}
-
-function encodeSegment(value: unknown): string {
-	return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(value)));
-}
+const jwksDoc = accessJwksDocument;
+const encodeSegment = encodeJwtSegment;
 
 /** Default Access claims; `over` replaces individual claims per test. */
 function claims(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -103,17 +100,11 @@ function claims(over: Record<string, unknown> = {}): Record<string, unknown> {
 	};
 }
 
-async function signRs256(
+function signRs256(
 	payload: Record<string, unknown>,
 	header: Record<string, unknown> = { alg: "RS256", kid: PRIMARY_KID, typ: "JWT" },
 ): Promise<string> {
-	const signingInput = `${encodeSegment(header)}.${encodeSegment(payload)}`;
-	const signature = await crypto.subtle.sign(
-		{ name: "RSASSA-PKCS1-v1_5" },
-		keyPair.privateKey,
-		new TextEncoder().encode(signingInput),
-	);
-	return `${signingInput}.${bytesToBase64Url(new Uint8Array(signature))}`;
+	return signAccessJwt(payload, header);
 }
 
 interface JwksStub {

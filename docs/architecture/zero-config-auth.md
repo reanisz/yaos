@@ -135,6 +135,51 @@ Under `SYNC_TOKEN`, the operator API answers `409 { "error": "unsupported_in_env
 
 This is a deliberate limit. Env mode's defining property is that it makes **zero** Durable Object calls per request: the token comes from the environment and is compared in the Worker. The vault-token map lives in the config DO, so honouring it in env mode would mean putting a `YAOS_CONFIG` round-trip back on every authenticated request — reintroducing exactly the per-request DO amplification that issue #40 removed. Deployments that want per-vault tokens use the claim flow, which already pays for (and caches) that read.
 
+### Access-gated admin page
+
+Managing vault tokens with `curl` and a bearer token works, but it is the same terminal step the claim flow exists to avoid. `/admin` is a server-rendered page — one document, no external assets, same style as the setup page — that lists the issued tokens and lets an operator issue, rotate and revoke them in a browser. An issued token is shown once, with a copy button, the `obsidian://` setup link and the mobile setup QR, so onboarding a vault from the admin page is the same one-scan flow the claim page offers.
+
+It is authenticated by **Cloudflare Access**, not by the bearer token, and it exists only where Access is configured:
+
+```toml
+# server/wrangler.toml
+[vars]
+YAOS_ACCESS_TEAM_DOMAIN = "myteam.cloudflareaccess.com"
+YAOS_ACCESS_AUD = "<the Access application's 64-hex AUD tag>"
+```
+
+**Both variables, or the feature does not exist.** With either absent or malformed, every `/admin` path returns the identical 404 JSON any unknown URL returns, before any Durable Object namespace is touched. Not 403, not a login redirect: a deployment that never opted in is byte-for-byte the server it was before. A half-configured deployment is treated as disabled and logs one `console.warn` naming the offending variable (once per isolate, because the 404 path is exactly what scanners hammer).
+
+#### The custom-domain requirement, and why the Worker verifies the JWT itself
+
+Access protects a **hostname**, so the Worker must be served on a custom domain in your zone; Access cannot be placed in front of a `workers.dev` URL. That is also why the header alone is worthless as a credential: the same Worker script stays reachable on `workers.dev` and on every other route bound to it, and those requests never traverse Access. "The request arrived, therefore Access allowed it" is false, and `Cf-Access-Jwt-Assertion` is a header anyone can set.
+
+So `server/src/accessJwt.ts` verifies the token in the Worker: RS256 signature against the team's published JWKS (`https://<team-domain>/cdn-cgi/access/certs`, cached for 10 minutes with a rate-limited re-fetch on key rotation), `iss` equal to the team domain, and `aud` containing the configured application tag. Failures return 401 with no detail; the machine-readable reason tag is logged, never echoed to the client. A request with no header is refused before any JWKS fetch, and neither path reads the config Durable Object.
+
+#### CSRF posture
+
+The bearer-token `/api` surface can safely carry permissive CORS headers: a browser never attaches that credential on its own, so a cross-origin page has nothing to replay. Access is the opposite — it authenticates with the `CF_Authorization` cookie, which *is* ambient. Three properties keep that from mattering:
+
+- **No CORS headers on any admin response, ever.** A cross-origin fetch may still be sent, but its response is unreadable, and a JSON `POST` is preflighted — the preflight has no arm in the route classifier, so it 404s and the mutating request is never made.
+- **`Content-Type: application/json` is required** on both POST endpoints (`415 unsupported_media_type` otherwise). The three content types an HTML form can produce without a preflight are exactly the ones this refuses.
+- **The Access cookie's `SameSite` attribute** is a third layer, and the only one this design does not rely on: Cloudflare defaults `CF_Authorization` to `SameSite=Lax` (so it is not attached to a cross-site POST at all), but the attribute is configurable per Access application and can be set to `None`. The two properties above hold whichever value it has.
+
+#### Semantics
+
+`GET /admin/api/vault-tokens`, `POST /admin/api/vault-tokens` and `POST /admin/api/vault-tokens/revoke` share one implementation with the bearer-token API described above, so the two front doors cannot drift. The admin API additionally requires **claim mode**: env mode answers `409 unsupported_in_env_mode` and an unclaimed server answers `503 unclaimed`, for the reasons in the section below. The page renders in all three states — an operator who lands on an unclaimed or env-mode server is told why there is no form rather than shown a broken one. The issue response also carries `mobileSetupQrDataUrl`; if QR rendering fails the field is `null` and the token is still returned, because the rotation is already durable by then and losing the plaintext would lock the operator out of that vault.
+
+Nothing secret is rendered into the page: the HTML carries only the server's own origin and its auth mode, and tokens reach the browser exclusively as the JSON body of an issue call. The page response also carries `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY` — it is the only authenticated, state-changing page in the product, and Access authenticates it with an ambient cookie, which is exactly what clickjacking needs. The JSON responses carry neither: a JSON body is not framable content.
+
+#### Audit trail
+
+A successful issue or revoke **through the admin front door** logs one line:
+
+```
+[yaos-sync:worker] admin audit: {"action":"issue","vaultIdHint":"vault-al","actor":"operator@example.test"}
+```
+
+It is emitted on `console.debug`, the channel the per-request access log already uses, and is self-identifying — grep `admin audit`. `actor` is the Access token's `email`, falling back to `sub`, then to `"unknown"`. It is logged in full — a truncated identity is not an audit record — while the `vaultId` keeps the repo's eight-character truncation so it cannot become a correlation handle in exported logs. The token and the label are never logged, and nothing is logged for reads, rejected input, or failed authentication beyond the rejection warning above. The bearer-token API emits no such line and cannot: its caller is an anonymous secret, so there is no identity to record.
+
 ## Planned hardening (post-current)
 
 - Replace `tokenHash`-as-signing-key with a random per-server ticket signing secret generated at claim time and stored in the Config DO.  This removes the promotion of the token verifier hash to signing authority.  Existing deployments would backfill lazily on next claim.

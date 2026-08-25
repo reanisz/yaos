@@ -29,6 +29,15 @@
  * isolates keep serving their cached config until its 60s TTL expires, so an
  * issue or a revoke is globally in effect within one TTL window — see
  * AUTH_CONFIG_CACHE_TTL_MS in routes/auth.ts.
+ *
+ * # Two front doors, one implementation
+ * The three operations below (listVaultTokens / issueVaultToken /
+ * revokeVaultToken) are exported because the Access-gated admin API in
+ * routes/admin.ts drives exactly the same state.  They deliberately return
+ * data rather than Responses: the two surfaces authenticate differently and
+ * shape their errors differently, but a second copy of "mint 32 bytes, store
+ * the hash, invalidate the cache" is how the two would drift into disagreeing
+ * about what a token is.
  */
 
 import { randomBase64Url } from "../base64url";
@@ -57,11 +66,39 @@ const VAULT_TOKEN_BYTES = 32;
 export type VaultTokensAction = "list" | "issue" | "revoke";
 
 /** Public view of one stored token.  Deliberately never carries tokenHash. */
-interface VaultTokenSummary {
+export interface VaultTokenSummary {
 	vaultId: string;
 	label: string | null;
 	createdAt: number;
 }
+
+/** Everything a freshly issued token consists of.  `token` exists only here. */
+export interface IssuedVaultToken {
+	vaultId: string;
+	token: string;
+	label: string | null;
+	createdAt: number;
+	obsidianUrl: string;
+}
+
+/**
+ * A rejected mutation, already mapped to the status its caller should answer
+ * with.  Returned rather than thrown so neither front door can forget to
+ * distinguish "the operator asked for something invalid" (400) from "the
+ * config Durable Object failed" (500) — see forwardConfigFailure.
+ */
+export interface VaultTokenFailure {
+	error: string;
+	status: 400 | 500;
+}
+
+export type IssueVaultTokenResult =
+	| { ok: true; issued: IssuedVaultToken }
+	| { ok: false; failure: VaultTokenFailure };
+
+export type RevokeVaultTokenResult =
+	| { ok: true; existed: boolean }
+	| { ok: false; failure: VaultTokenFailure };
 
 /**
  * Summarise the stored map for the operator.
@@ -70,7 +107,7 @@ interface VaultTokenSummary {
  * offline attacker a target, so the projection is explicit rather than a
  * spread of the record.
  */
-function summarizeVaultTokens(config: StoredServerConfig): VaultTokenSummary[] {
+export function listVaultTokens(config: StoredServerConfig): VaultTokenSummary[] {
 	const tokens = config.vaultTokens ?? {};
 	return Object.entries(tokens)
 		.map(([vaultId, record]) => ({ vaultId, label: record.label, createdAt: record.createdAt }))
@@ -91,13 +128,13 @@ async function callConfigDurableObject(env: Env, path: string, body: unknown): P
 }
 
 /**
- * Turn a Durable Object failure into an operator-facing response.
+ * Turn a Durable Object failure into an operator-facing failure.
  *
  * A 400 from the DO is a rejected input (bad vaultId, label too long, cap
  * reached) and is forwarded verbatim; anything else is a server fault and must
  * not be reported as the caller's mistake.
  */
-async function forwardConfigFailure(res: Response, fallback: string): Promise<Response> {
+async function forwardConfigFailure(res: Response, fallback: string): Promise<VaultTokenFailure> {
 	let message = fallback;
 	try {
 		const payload: { error?: unknown } = await res.json();
@@ -107,7 +144,63 @@ async function forwardConfigFailure(res: Response, fallback: string): Promise<Re
 	} catch {
 		// Non-JSON body: keep the fallback message.
 	}
-	return json({ error: message }, res.status === 400 ? 400 : 500);
+	return { error: message, status: res.status === 400 ? 400 : 500 };
+}
+
+/**
+ * Mint a token for `vaultId`, replacing any token that vault already had.
+ *
+ * The plaintext exists only in the return value: the DO stores its SHA-256 and
+ * nothing writes the token itself anywhere — not a log line, not a trace.
+ * `origin` is the server's own origin, used to build the setup deep link.
+ *
+ * Callers MUST treat a successful result as the single delivery of the
+ * plaintext: the rotation is already durable by the time this returns, so
+ * dropping the value on the floor locks the operator out of that vault until
+ * they issue again.
+ */
+export async function issueVaultToken(
+	env: Env,
+	origin: string,
+	vaultId: string,
+	label: string | null,
+): Promise<IssueVaultTokenResult> {
+	const token = randomBase64Url(VAULT_TOKEN_BYTES);
+	const tokenHash = await sha256Hex(new TextEncoder().encode(token));
+	const createdAt = Date.now();
+
+	const res = await callConfigDurableObject(env, "/__yaos/vault-tokens", {
+		vaultId,
+		tokenHash,
+		label,
+		createdAt,
+	});
+	if (!res.ok) {
+		return { ok: false, failure: await forwardConfigFailure(res, "vault token write failed") };
+	}
+	invalidateStoredServerConfigCache();
+
+	return {
+		ok: true,
+		issued: {
+			vaultId,
+			token,
+			label,
+			createdAt,
+			obsidianUrl: buildObsidianSetupUrl(origin, token, vaultId),
+		},
+	};
+}
+
+/** Delete `vaultId`'s token.  `existed` is false when it had none. */
+export async function revokeVaultToken(env: Env, vaultId: string): Promise<RevokeVaultTokenResult> {
+	const res = await callConfigDurableObject(env, "/__yaos/vault-tokens/revoke", { vaultId });
+	if (!res.ok) {
+		return { ok: false, failure: await forwardConfigFailure(res, "vault token revoke failed") };
+	}
+	const payload: { existed?: unknown } = await res.json();
+	invalidateStoredServerConfigCache();
+	return { ok: true, existed: payload.existed === true };
 }
 
 async function readVaultTokenBody(req: Request): Promise<{ vaultId?: unknown; label?: unknown } | null> {
@@ -152,7 +245,7 @@ export async function handleVaultTokensRoute(
 		// Served from the config the auth path already fetched — no extra DO
 		// call.  Reflects writes made through another isolate within the config
 		// cache TTL.
-		return json({ ok: true, vaultTokens: summarizeVaultTokens(authState.config) });
+		return json({ ok: true, vaultTokens: listVaultTokens(authState.config) });
 	}
 
 	const body = await readVaultTokenBody(req);
@@ -170,38 +263,17 @@ export async function handleVaultTokensRoute(
 	}
 
 	if (action === "revoke") {
-		const res = await callConfigDurableObject(env, "/__yaos/vault-tokens/revoke", { vaultId });
-		if (!res.ok) {
-			return await forwardConfigFailure(res, "vault token revoke failed");
+		const revoked = await revokeVaultToken(env, vaultId);
+		if (!revoked.ok) {
+			return json({ error: revoked.failure.error }, revoked.failure.status);
 		}
-		const payload: { existed?: unknown } = await res.json();
-		invalidateStoredServerConfigCache();
-		return json({ ok: true, existed: payload.existed === true });
+		return json({ ok: true, existed: revoked.existed });
 	}
 
-	// Issue.  The plaintext exists only in this response: the DO stores its
-	// SHA-256 and nothing writes the token itself anywhere.
-	const token = randomBase64Url(VAULT_TOKEN_BYTES);
-	const tokenHash = await sha256Hex(new TextEncoder().encode(token));
-	const createdAt = Date.now();
-
-	const res = await callConfigDurableObject(env, "/__yaos/vault-tokens", {
-		vaultId,
-		tokenHash,
-		label,
-		createdAt,
-	});
-	if (!res.ok) {
-		return await forwardConfigFailure(res, "vault token write failed");
+	// Issue.  The plaintext is in this response and nowhere else.
+	const issued = await issueVaultToken(env, new URL(req.url).origin, vaultId, label);
+	if (!issued.ok) {
+		return json({ error: issued.failure.error }, issued.failure.status);
 	}
-	invalidateStoredServerConfigCache();
-
-	return json({
-		ok: true,
-		vaultId,
-		token,
-		label,
-		createdAt,
-		obsidianUrl: buildObsidianSetupUrl(new URL(req.url).origin, token, vaultId),
-	});
+	return json({ ok: true, ...issued.issued });
 }

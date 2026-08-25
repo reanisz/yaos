@@ -58,3 +58,34 @@ enabled = true
 #
 # [vars]
 # YAOS_ENABLE_ADMIN_ROUTES = "true"
+
+# ---------------------------------------------------------------------------
+# Cloudflare Access-gated /admin page (per-vault token management)
+# ---------------------------------------------------------------------------
+#
+# Set BOTH variables below to enable the /admin page and its JSON API:
+#   GET  /admin                              — the management page
+#   GET  /admin/api/vault-tokens             — list issued tokens
+#   POST /admin/api/vault-tokens             — issue / rotate a vault token
+#   POST /admin/api/vault-tokens/revoke      — revoke one
+#
+# With either variable absent or malformed, every /admin path returns the same
+# HTTP 404 as any unknown URL, with no Durable Object access — a deployment
+# that does not opt in behaves exactly as it did before the feature existed.
+#
+# Setup:
+#   1. Serve this Worker on a custom domain in your zone.  Cloudflare Access
+#      protects hostnames and CANNOT be placed in front of a workers.dev URL.
+#   2. Create a self-hosted Access application covering <your-domain>/admin
+#      and attach the policy that decides who may manage tokens.
+#   3. Copy the application's AUD tag (64 hex characters) into YAOS_ACCESS_AUD
+#      and your team domain into YAOS_ACCESS_TEAM_DOMAIN.
+#
+# The Worker verifies the Access JWT itself — signature against the team's
+# JWKS, issuer, and audience — so the script staying reachable on workers.dev,
+# where Access never runs, does not open the page: those requests carry no
+# valid token and are refused with 401.
+#
+# [vars]
+# YAOS_ACCESS_TEAM_DOMAIN = "myteam.cloudflareaccess.com"
+# YAOS_ACCESS_AUD = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

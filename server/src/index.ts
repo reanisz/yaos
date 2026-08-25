@@ -1,6 +1,8 @@
+import { getAccessConfig } from "./accessJwt";
 import { ServerConfig, type StoredServerConfig } from "./config";
 import { VaultSyncServer } from "./server";
 import { renderMobileSetupPage, renderRunningPage, renderSetupPage } from "./setupPage";
+import { adminRouteBucket, handleAdminRoute, type AdminAction } from "./routes/admin";
 import {
 	canonicalRepoForSetup,
 	getAuthStateCached,
@@ -46,6 +48,7 @@ type WorkerRoute =
 	| { kind: "claim" }
 	| { kind: "update-metadata" }
 	| { kind: "vault-tokens"; action: VaultTokensAction }
+	| { kind: "admin"; action: AdminAction }
 	| { kind: "sync-socket"; vaultId: string }
 	| { kind: "vault"; vaultId: string; resource: string; rest: string[] }
 	| { kind: "not-found" };
@@ -84,6 +87,20 @@ const VALID_VAULT_RESOURCES = new Set(["auth", "debug", "blobs", "snapshots"]);
 // into one: classifyWorkerRoute matches those on an exact method + pathname
 // pair, so every unlisted method and every extra path segment falls through to
 // not-found on its own — which the step (4) test must still prove.
+//
+// ROUTES THAT EXIST ONLY UNDER SOME CONFIGURATIONS (/admin/*)
+//
+// classifyWorkerRoute is pure — method and pathname only — so it cannot know
+// whether Cloudflare Access is configured, and it classifies the admin shapes
+// unconditionally.  worker.fetch then downgrades them to not-found when
+// getAccessConfig(env) returns null, BEFORE anything else looks at the route.
+// That ordering is the invariant: on a deployment that never set the Access
+// variables, every /admin path must produce the same body, the same headers
+// and the same log bucket as /wp-login.php, with zero Durable Object access
+// and zero subrequests.  A new admin route must keep that property and must be
+// covered by the trap-env assertions in
+// tests/server/server-route-classification-runtime.ts (Access unset) and
+// tests/server/admin-routes.ts (Access set, no valid JWT).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -209,6 +226,29 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 		return { kind: "vault-tokens", action: "revoke" };
 	}
 
+	// Cloudflare Access-gated admin surface.  Exact method + pathname pairs
+	// only: "/admin/", "/admin/foo", DELETE /admin/api/vault-tokens and
+	// /admin/api/vault-tokens/extra all fall through to not-found below.
+	//
+	// There is deliberately no OPTIONS arm — admin responses never carry CORS
+	// headers (see routes/admin.ts), so a cross-origin preflight must fail
+	// rather than be answered.  The classifier stays pure: whether /admin
+	// exists on this deployment at all depends on the environment, and that
+	// decision is made once in worker.fetch, not here.
+	if (req.method === "GET" && url.pathname === "/admin") {
+		return { kind: "admin", action: "page" };
+	}
+
+	if (url.pathname === "/admin/api/vault-tokens") {
+		if (req.method === "GET") return { kind: "admin", action: "list" };
+		if (req.method === "POST") return { kind: "admin", action: "issue" };
+		return { kind: "not-found" };
+	}
+
+	if (req.method === "POST" && url.pathname === "/admin/api/vault-tokens/revoke") {
+		return { kind: "admin", action: "revoke" };
+	}
+
 	// parseSyncPath MUST run before parseVaultPath.  /vault/sync/:vaultId
 	// would otherwise be misread as vaultId="sync", resource=:vaultId and then
 	// rejected by the resource whitelist as not-found.
@@ -253,6 +293,7 @@ function routeBucket(route: WorkerRoute): string {
 		case "claim": return "claim";
 		case "update-metadata": return "api_update_metadata";
 		case "vault-tokens": return `api_vault_tokens_${route.action}`;
+		case "admin": return adminRouteBucket(route.action);
 		case "sync-socket": return "vault_sync";
 		case "vault": return `vault_${route.resource}`;
 		case "not-found": return "not_found";
@@ -368,9 +409,33 @@ const worker = {
 	async fetch(req: Request, env: Env): Promise<Response> {
 		const start = Date.now();
 		const url = new URL(req.url);
-		const route = classifyWorkerRoute(req, url);
+		const classified = classifyWorkerRoute(req, url);
 		const isWebSocket = req.headers.get("upgrade")?.toLowerCase() === "websocket";
 		const cfRay = req.headers.get("cf-ray");
+
+		// /admin exists only where Cloudflare Access is configured.
+		// getAccessConfig reads the environment and nothing else — no Durable
+		// Object, no network — and returns null unless both variables are present
+		// and well formed.  Dispatching here, before getAuthStateCached below,
+		// keeps an unauthenticated admin request free of any YAOS_CONFIG read.
+		if (classified.kind === "admin") {
+			const accessConfig = getAccessConfig(env);
+			if (accessConfig !== null) {
+				// Access is the gate, so no bearer-token auth is performed and the
+				// log line says so.
+				const response = await handleAdminRoute(req, env, url, classified.action, accessConfig);
+				logWorkerRequest({ route: classified, method: req.method, status: response.status, durationMs: Date.now() - start, auth: "skipped", isWebSocket, cfRay });
+				return response;
+			}
+		}
+
+		// An admin shape on a deployment that never configured Access is not
+		// "forbidden", it is nonexistent: it falls through to exactly the
+		// not-found path any unknown URL takes — same body, same headers, same
+		// (sampled) log bucket.
+		const route = classified.kind === "admin"
+			? ({ kind: "not-found" } as const)
+			: classified;
 
 		// Unknown routes 404 immediately — no YAOS_CONFIG, no YAOS_SYNC.
 		// This is the primary fix for issue #40: scanner/probe traffic no longer
