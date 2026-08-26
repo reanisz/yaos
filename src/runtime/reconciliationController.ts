@@ -36,7 +36,9 @@ import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+	ORIGIN_EDITOR_BIND_ARBITRATION,
 } from "../sync/origins";
+import { decideClosedFileConflict } from "../sync/closedFileConflict";
 import { planClosedFileReconcile } from "./reconcile/closedFilePlanner";
 import { planBaselineAdvancement, type BaselineActionKind } from "./reconcile/baselineAdvancementPolicy";
 import { evaluateSafetyBrake } from "./reconcile/safetyBrakePolicy";
@@ -283,6 +285,13 @@ export class ReconciliationController {
 	private markdownDrainTimer: number | null = null;
 	private lastMarkdownDirtyAt = 0;
 	private boundRecoveryLocks = new Map<string, number>();
+	/**
+	 * Paths with a bind-time divergence arbitration currently running.
+	 *
+	 * syncFileFromDisk consults this and skips. See resolveEditorDivergenceForBind
+	 * for why the two must not interleave.
+	 */
+	private bindDivergenceArbitrations = new Set<string>();
 	private recoveryFingerprints = new Map<string, FingerprintEntry>();
 	/**
 	 * Per-path amplification history for the monotonic-growth quarantine.
@@ -1263,6 +1272,246 @@ export class ReconciliationController {
 			});
 	}
 
+	/**
+	 * Arbitrate an editor buffer that disagrees with the CRDT, so the view can
+	 * be bound. Injected into EditorBindingManager as its bind-time divergence
+	 * arbiter; see BindDivergenceArbiter in src/sync/editorBinding.ts.
+	 *
+	 * # Why this exists
+	 *
+	 * y-codemirror performs no initial sync. Startup reconcile DEFERS open files
+	 * (planClosedFileReconcile Rule 2, "open-or-bound"), then onReconciled binds
+	 * them — so a note edited on disk while the plugin was unloaded gets bound
+	 * DIVERGED, and every subsequent keystroke lands at a wrong offset in the
+	 * shared document, in both directions, and replicates.
+	 *
+	 * Declining and leaving the note unbound is not an option either. Reconcile
+	 * defers on open-ness ALONE (isOpenOrBound), the default "always" external
+	 * edit policy has the next autosave diff-merge the buffer into the CRDT and
+	 * silently discard the remote-only edits, and DiskMirror force-writes CRDT
+	 * content over the diverged disk file once the leaf stops being the active
+	 * view. The divergence has to be RESOLVED, then bound.
+	 *
+	 * # The decision
+	 *
+	 * Same three-way shape as the closed-file planner, with the BUFFER standing
+	 * in for the local side rather than the disk file — the buffer is what the
+	 * user is looking at, and disk can lag it by the autosave debounce:
+	 *
+	 *   buffer == CRDT               → not actually diverged; bind.
+	 *   CRDT   == baseline           → only local changed (the offline-edit case).
+	 *                                  Import the buffer. No loss, no artifact.
+	 *   buffer == baseline           → only the CRDT changed (pure remote
+	 *                                  catch-up). Replace the buffer from the
+	 *                                  Y.Text.
+	 *   both changed, or no baseline → preserve the CRDT side as a conflict
+	 *                                  artifact, then import the buffer.
+	 *
+	 * That last line DELIBERATELY DEVIATES from decideClosedFileConflict's
+	 * missing-baseline mtime heuristic, which defaults to "CRDT wins" when it
+	 * has no evidence. Here there is evidence the closed-file path never has:
+	 * the user has this note open in front of them. Overwriting the buffer they
+	 * are looking at is the one outcome that reads as data loss even when
+	 * nothing is lost, so the visible side wins the file and the remote side is
+	 * preserved beside it.
+	 *
+	 * # Racing with the autosave path
+	 *
+	 * While this runs, an Obsidian autosave of the same buffer can fire
+	 * vault.modify → markMarkdownDirty → syncFileFromDisk, which under the
+	 * "always" policy would applyDiffToYText(disk → Y.Text) concurrently. Our
+	 * diff is computed against the Y.Text as we read it; if that write lands in
+	 * between, our character offsets are stale and we corrupt the document —
+	 * precisely the failure this whole change exists to prevent. Ordering does
+	 * not make it benign, because both paths are `await`-interleaved on the same
+	 * task queue. So syncFileFromDisk skips a path with an arbitration in
+	 * flight: the arbitration converges the CRDT to the buffer that the skipped
+	 * disk event was about to report anyway, and DiskMirror rewrites disk from
+	 * the CRDT afterwards.
+	 */
+	async resolveEditorDivergenceForBind(
+		path: string,
+		bufferContent: string,
+	): Promise<"resolved" | "declined"> {
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) return "declined";
+
+		const ytext = vaultSync.getTextForPath(path);
+		// No Y.Text: binding seeds one from the buffer. Nothing to arbitrate.
+		if (!ytext) return "resolved";
+
+		this.bindDivergenceArbitrations.add(path);
+		try {
+			const crdtContent = yTextToString(ytext) ?? "";
+			if (crdtContent === bufferContent) return "resolved";
+
+			const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
+			const bufferHash = await contentBaselineHash(bufferContent);
+			const crdtHash = await contentBaselineHash(crdtContent);
+
+			// Exact string equality, like the predicate in EditorBindingManager —
+			// no normalisation. y-codemirror maps offsets, so "equal after
+			// normalising line endings" is still a wrong-offset bind.
+			const decision = decideClosedFileConflict({
+				baselineHash,
+				diskHash: bufferHash,
+				crdtHash,
+			});
+
+			this.deps.trace("conflict", "bind-divergence-arbitration", {
+				path,
+				decision: decision.kind,
+				reason: "reason" in decision ? decision.reason : null,
+				bufferLength: bufferContent.length,
+				crdtLength: crdtContent.length,
+				hasBaseline: baselineHash !== null,
+			});
+
+			if (decision.kind === "no-op") return "resolved";
+
+			if (decision.kind === "apply-remote-to-disk") {
+				// buffer == baseline, CRDT ahead: pure remote catch-up. Replace the
+				// buffer from the Y.Text so the two agree before yCollab attaches.
+				return this.replaceOpenBuffersFromCrdt(path, crdtContent);
+			}
+
+			if (decision.kind === "preserve-conflict") {
+				// both-changed, or missing-baseline. See the deviation note above:
+				// the buffer always wins the file here, whatever winner the pure
+				// decision named, and the CRDT side is preserved beside it.
+				try {
+					const conflictPath = await this.createMarkdownConflictArtifact(
+						path,
+						crdtContent,
+						`bind-divergence-${decision.reason}`,
+						"crdt",
+					);
+					this.deps.trace("conflict", "bind-divergence-conflict-preserved", {
+						path,
+						conflictPath,
+						reason: decision.reason,
+						crdtLength: crdtContent.length,
+						bufferLength: bufferContent.length,
+					});
+					const fileName = path.split("/").pop() ?? path;
+					this.showConflictNotice(
+						`"${fileName}" had unsynced edits on this device and elsewhere. ` +
+						`Kept what is open in the editor; the other version is saved as ` +
+						`"${conflictPath.split("/").pop() ?? conflictPath}".`,
+					);
+				} catch (err) {
+					this.deps.getDiskMirror()?.recordPreservedUnresolved(
+						path,
+						// Same failure the closed-file lane records for the same
+						// reason; reusing the constant keeps the preserved-unresolved
+						// summary one bucket rather than two names for one thing.
+						"conflict-artifact-write-failed",
+					);
+					this.deps.trace("conflict", "bind-divergence-preserve-failed", {
+						path,
+						reason: decision.reason,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					// Declining leaves the note unbound but still tracked as open, so
+					// DiskMirror keeps deferring remote writes. Importing the buffer
+					// without the artifact would drop the remote side silently.
+					return "declined";
+				}
+			}
+
+			// Both the import-disk-to-crdt case and the preserve-conflict case end
+			// the same way: the buffer becomes the CRDT content.
+			return this.importBufferIntoCrdt(path, ytext, crdtContent, bufferContent);
+		} catch (err) {
+			this.deps.trace("conflict", "bind-divergence-arbitration-failed", {
+				path,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return "declined";
+		} finally {
+			this.bindDivergenceArbitrations.delete(path);
+		}
+	}
+
+	/**
+	 * Import the editor buffer into the Y.Text and verify it took.
+	 *
+	 * Re-reads the Y.Text immediately before diffing rather than trusting the
+	 * `crdtContent` captured before the awaits above: applyDiffToYText applies
+	 * index-based ops derived from `oldText`, so a stale base is a corruption,
+	 * not a missed update.
+	 */
+	private importBufferIntoCrdt(
+		path: string,
+		ytext: ReturnType<VaultSync["getTextForPath"]>,
+		expectedCrdtContent: string,
+		bufferContent: string,
+	): "resolved" | "declined" {
+		if (!ytext) return "declined";
+		const current = yTextToString(ytext) ?? "";
+		if (current === bufferContent) return "resolved";
+		if (current !== expectedCrdtContent) {
+			this.deps.trace("conflict", "bind-divergence-import-stale-base", {
+				path,
+				expectedLength: expectedCrdtContent.length,
+				actualLength: current.length,
+			});
+			return "declined";
+		}
+
+		applyDiffToYText(ytext, current, bufferContent, ORIGIN_EDITOR_BIND_ARBITRATION);
+
+		const after = yTextToString(ytext) ?? "";
+		if (after !== bufferContent) {
+			this.deps.trace("conflict", "bind-divergence-import-postcondition-failed", {
+				path,
+				expectedLength: bufferContent.length,
+				actualLength: after.length,
+			});
+			return "declined";
+		}
+		this.deps.log(
+			`bind-divergence: imported editor buffer for "${path}" ` +
+			`(${expectedCrdtContent.length} -> ${bufferContent.length} chars)`,
+		);
+		return "resolved";
+	}
+
+	/**
+	 * Replace every open buffer for `path` with the CRDT content.
+	 *
+	 * `Editor.setValue` is Obsidian's public whole-document replacement and the
+	 * only one available here — EditorBindingManager owns CM dispatch, and this
+	 * runs while the path is deliberately unbound, so there is no compartment to
+	 * dispatch through. It resets the cursor to the document start; that is
+	 * accepted, and it only happens on the pure-remote-catch-up branch, where
+	 * the buffer held nothing the user had not already seen synced.
+	 */
+	private replaceOpenBuffersFromCrdt(
+		path: string,
+		crdtContent: string,
+	): "resolved" | "declined" {
+		const views = this.getOpenMarkdownViewsForPath(path);
+		if (views.length === 0) return "declined";
+		for (const view of views) {
+			try {
+				if (view.editor.getValue() === crdtContent) continue;
+				view.editor.setValue(crdtContent);
+			} catch (err) {
+				this.deps.trace("conflict", "bind-divergence-buffer-replace-failed", {
+					path,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				return "declined";
+			}
+		}
+		this.deps.log(
+			`bind-divergence: replaced editor buffer for "${path}" from the CRDT ` +
+			`(${crdtContent.length} chars, cursor reset)`,
+		);
+		return "resolved";
+	}
+
 	private scheduleMarkdownDrain(): void {
 		if (this.markdownDrainTimer) {
 			window.clearTimeout(this.markdownDrainTimer);
@@ -1349,6 +1598,30 @@ export class ReconciliationController {
 		const runtimeConfig = this.deps.getRuntimeConfig();
 		if (!vaultSync) return;
 		if (!this.deps.isMarkdownPathSyncable(file.path)) return;
+
+		// Bind-time divergence arbitration owns this path for the moment. Both
+		// paths write the Y.Text from a base string they captured earlier, and
+		// both `await` in between, so an interleave applies index-based diff ops
+		// against a document that has moved underneath them. Skipping is safe in
+		// a way that interleaving is not: arbitration converges the CRDT to the
+		// live editor buffer, which is what this disk event is reporting (or a
+		// prefix of it), and DiskMirror rewrites disk from the CRDT once the path
+		// binds. See resolveEditorDivergenceForBind.
+		if (this.bindDivergenceArbitrations.has(file.path)) {
+			this.deps.log(
+				`syncFileFromDisk: skipping "${file.path}" (bind-divergence arbitration in flight)`,
+			);
+			// Its own kind, not "recovery-postcondition-skipped": nothing here has
+			// evaluated a postcondition, and a consumer filtering by kind would
+			// misfile it among the bound-recovery events. Shape follows
+			// "import-untracked-skipped-preserved-unresolved" — subject, skipped,
+			// reason.
+			this.deps.trace("reconcile", "sync-from-disk-skipped-bind-arbitration", {
+				path: file.path,
+				reason: "bind-divergence-arbitration-in-flight",
+			});
+			return;
+		}
 
 		// If the user modifies or creates a file that was previously
 		// preserved-unresolved, that is intentional user action. Clear the

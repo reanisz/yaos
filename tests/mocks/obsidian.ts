@@ -21,9 +21,21 @@ export class MarkdownView {}
 /** Stub class. Used in instanceof checks inside DiskMirror's vault event handlers. */
 export class TFile {}
 
-/** Notice constructor used by runtime controllers. */
+/**
+ * Notice constructor used by runtime controllers.
+ *
+ * Records what it was asked to show. Product code constructs `new Notice(...)`
+ * against a live ESM binding, so a suite cannot spy on it any other way — and
+ * "did the user get told?" is a real assertion for the conflict paths, which
+ * preserve a competing version of a note and are silent failures if nobody
+ * says so. Nothing in src/ reads `shown`.
+ */
 export class Notice {
-	constructor(_message: string, _timeout?: number) {}
+	static readonly shown: Array<{ message: string; timeout?: number }> = [];
+
+	constructor(message: string, timeout?: number) {
+		Notice.shown.push({ message, timeout });
+	}
 }
 
 /** Stub class. Type-only in DiskMirror but exported for completeness. */
