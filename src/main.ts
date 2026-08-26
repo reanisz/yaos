@@ -766,6 +766,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
 				(path) => this.isMarkdownPathSyncable(path),
+				// Bind-time divergence arbiter. The controller owns the three tools
+				// arbitration needs — the disk-index baseline, the conflict-artifact
+				// writer and applyDiffToYText — and EditorBindingManager must not
+				// import it (the dependency already runs the other way).
+				(path, bufferContent) =>
+					this.reconciliationController.resolveEditorDivergenceForBind(path, bufferContent),
+				// Settled-buffer probe. `view.file` updates before the editor
+				// document loads, so bind() cannot tell "this buffer is the file" from
+				// "this buffer is still the previous file, or empty" without a second
+				// opinion. Disk is that opinion. `read`, not `cachedRead`: the cache
+				// is invalidated by events we may be racing.
+				async (path: string) => {
+					const file = this.app.vault.getAbstractFileByPath(path);
+					if (!(file instanceof TFile)) return null;
+					return await this.app.vault.read(file).catch(() => null);
+				},
 			);
 
 			// 3. Global CM6 extension.

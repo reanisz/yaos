@@ -200,6 +200,7 @@ export class EditorWorkspaceOrchestrator {
 
 		let unbound = 0;
 		let bound = 0;
+		let skipped = 0;
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
 			if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) return;
 			const path = leaf.view.file.path;
@@ -224,6 +225,19 @@ export class EditorWorkspaceOrchestrator {
 			// unbound.
 			if (editorBindings.getBindingHealthForView(leaf.view)?.bound) return;
 
+			// Re-inclusion is the one bind site that routinely meets a diverged
+			// pair, and it is diverged BECAUSE of the scope guards: while the path
+			// was excluded the user edited the buffer and the CRDT kept taking
+			// remote edits, with nothing reconciling them. y-codemirror does no
+			// initial sync, so binding a mismatched pair would map the next
+			// keystroke onto the wrong offset in the shared document.
+			//
+			// The refusal now lives in bind() itself, which arbitrates the
+			// divergence and re-binds once the two sides agree. This sweep goes
+			// through bindView unconditionally so that trackOpenFile still runs:
+			// an unbound, un-tracked path is NOT a safe resting state — a remote
+			// write would take DiskMirror's closed-file lane and force CRDT
+			// content over the diverged file within ~300ms.
 			this.bindView(leaf.view);
 
 			// Count only if the bind actually took. bind() legitimately refuses
@@ -235,12 +249,23 @@ export class EditorWorkspaceOrchestrator {
 			// to prevent.
 			if (editorBindings.getBindingHealthForView(leaf.view)?.bound) {
 				bound += 1;
+				return;
+			}
+
+			// Not bound. Report a divergence refusal separately from the other
+			// reasons bind() declines, so a sweep summary distinguishes "the user
+			// has two competing versions of this note" from "no CM view yet".
+			if (!editorBindings.canBindWithoutDivergence(leaf.view)) {
+				skipped += 1;
+				this.deps.log(
+					`Sync scope changed (${reason}) — "${path}" not yet bound: editor and CRDT diverged, arbitrating`,
+				);
 			}
 		});
 
-		if (unbound > 0 || bound > 0) {
+		if (unbound > 0 || bound > 0 || skipped > 0) {
 			this.deps.log(
-				`Sync scope changed (${reason}) — unbound ${unbound}, bound ${bound}`,
+				`Sync scope changed (${reason}) — unbound ${unbound}, bound ${bound}, diverged ${skipped}`,
 			);
 			this.deps.scheduleTraceStateSnapshot(`sync-scope-changed:${reason}`);
 		}

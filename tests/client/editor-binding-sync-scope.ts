@@ -299,6 +299,8 @@ s.section("Test 7: onSyncScopeChanged — an already-bound view unbinds when it 
 	let scope: (path: string) => boolean = () => true;
 
 	const boundPaths = new Set([EXCLUDED, IN_SCOPE]);
+	/** Paths whose editor buffer no longer matches the CRDT. */
+	const diverged = new Set<string>();
 	const editorBindings = partialOf<EditorBindingManager>({
 		isBound: (path: string) => boundPaths.has(path),
 		// Per-LEAF probe: onSyncScopeChanged uses this rather than the path-keyed
@@ -310,6 +312,7 @@ s.section("Test 7: onSyncScopeChanged — an already-bound view unbinds when it 
 			settling: false,
 			issues: [],
 		}),
+		canBindWithoutDivergence: (view: MarkdownView) => !diverged.has(view.file?.path ?? "?"),
 		unbindByPath: (path: string) => { unbound.push(path); boundPaths.delete(path); },
 		bind: (view: MarkdownView) => {
 			const p = view.file?.path ?? "?";
@@ -352,6 +355,159 @@ s.section("Test 7: onSyncScopeChanged — an already-bound view unbinds when it 
 	scope = () => true;
 	orchestrator.onSyncScopeChanged("settings-change");
 	eq(bound, [EXCLUDED], "re-including the path rebinds the still-open view");
+}
+
+// ── Test 8: re-inclusion refuses to bind a diverged buffer ─────────────────
+
+s.section("Test 8: onSyncScopeChanged — a diverged buffer is left unbound, not bound");
+{
+	// y-codemirror does NO initial sync: binding maps the next keystroke's
+	// offset straight into the Y.Text. While a path was excluded the user could
+	// edit the buffer while the CRDT kept taking remote edits, with nothing
+	// reconciling them — so re-inclusion is the one bind site that routinely
+	// meets a diverged pair. Binding there would corrupt the shared document
+	// for every device.
+	//
+	// CHANGED with bind-time divergence arbitration. The sweep no longer
+	// short-circuits above bindView on a divergence probe. It could not: the
+	// probe's `return` also skipped trackOpenFile, and an open-but-untracked
+	// path is not a safe resting state — DiskMirror's closed-file lane force
+	// writes CRDT content over the diverged file within ~300ms. So the sweep now
+	// calls bindView unconditionally and bind() itself refuses (and arbitrates).
+	// What this test pins is unchanged in substance: the diverged view does not
+	// end up BOUND, and the sweep reports it separately from the other reasons a
+	// bind declines. The stub's bind() models the production refusal.
+	const bound: string[] = [];
+	const bindCalls: string[] = [];
+	const logs: string[] = [];
+	const boundPaths = new Set<string>();
+	const divergedPaths = new Set([EXCLUDED]);
+
+	const editorBindings = partialOf<EditorBindingManager>({
+		isBound: (path: string) => boundPaths.has(path),
+		getBindingHealthForView: (view: MarkdownView) => ({
+			bound: boundPaths.has(view.file?.path ?? "?"),
+			healthy: true,
+			settling: false,
+			issues: [],
+		}),
+		canBindWithoutDivergence: (view: MarkdownView) => !divergedPaths.has(view.file?.path ?? "?"),
+		unbindByPath: () => {},
+		bind: (view: MarkdownView) => {
+			const p = view.file?.path ?? "?";
+			bindCalls.push(p);
+			// Production: bind() gates on divergence internally and returns
+			// without attaching yCollab, having kicked off arbitration.
+			if (divergedPaths.has(p)) return;
+			bound.push(p);
+			boundPaths.add(p);
+		},
+	});
+
+	const leaves = [EXCLUDED, IN_SCOPE].map((path) =>
+		partialOf<WorkspaceLeaf>({
+			view: Object.assign(Object.create(MarkdownView.prototype) as MarkdownView, {
+				file: partialOf<TFile>({ path }),
+			}),
+		}),
+	);
+
+	const orchestrator = new EditorWorkspaceOrchestrator({
+		app: partialOf<import("obsidian").App>({
+			workspace: partialOf<Workspace>({
+				iterateAllLeaves: (cb: (leaf: WorkspaceLeaf) => void) => { leaves.forEach(cb); },
+			}),
+		}),
+		getSettings: () => partialOf<VaultSyncSettings>({ deviceName: "device" }),
+		getEditorBindings: () => editorBindings,
+		getDiskMirror: () => null as DiskMirror | null,
+		// Everything is back in scope — this is the re-inclusion sweep.
+		isMarkdownPathSyncable: () => true,
+		maybeImportDeferredClosedOnlyPath: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: (message: string) => { logs.push(message); },
+	});
+
+	orchestrator.onSyncScopeChanged("settings-change");
+
+	eq(bound, [IN_SCOPE], "the diverged view is NOT bound; the agreeing one is");
+	eq(
+		bindCalls,
+		[EXCLUDED, IN_SCOPE],
+		"both views still go through bindView, so trackOpenFile runs for the diverged path too",
+	);
+	s.check(
+		logs.some((l) => l.includes(EXCLUDED) && l.includes("diverged")),
+		`the refusal is logged against the path (logs: ${JSON.stringify(logs)})`,
+	);
+	s.check(
+		logs.some((l) => l.includes("diverged 1")),
+		"the sweep summary reports it separately from bound/unbound",
+	);
+}
+
+// ── Test 9: canBindWithoutDivergence itself ────────────────────────────────
+
+s.section("Test 9: canBindWithoutDivergence — the real implementation, not a stub");
+{
+	// Test 8 above drives the orchestrator against a STUBBED predicate, so it
+	// pins the orchestrator's use of it and nothing about the implementation.
+	// Review caught that gap: an implementation that always returned true would
+	// pass every other test here while re-opening the corruption it exists to
+	// prevent — y-codemirror does no initial sync, so binding onto a mismatched
+	// buffer maps the next keystroke to a wrong offset in the shared document.
+	const h = makeHarness({ existing: [IN_SCOPE] });
+	const ytext = h.texts.get(IN_SCOPE);
+	if (!ytext) throw new Error("fixture: expected a seeded Y.Text");
+	ytext.insert(0, "shared content");
+
+	s.check(
+		h.manager.canBindWithoutDivergence(makeView(IN_SCOPE, "shared content")),
+		"buffer matching the Y.Text is safe to bind",
+	);
+	s.check(
+		!h.manager.canBindWithoutDivergence(makeView(IN_SCOPE, "shared content plus local edits")),
+		"buffer diverged from the Y.Text is NOT safe to bind",
+	);
+	s.check(
+		!h.manager.canBindWithoutDivergence(makeView(IN_SCOPE, "")),
+		"an empty buffer against a non-empty Y.Text is divergence, not a fresh file",
+	);
+
+	// No Y.Text yet: binding will seed one FROM the buffer, so there is nothing
+	// to diverge from. Returning false here would refuse every first open.
+	s.check(
+		h.manager.canBindWithoutDivergence(makeView("notes/brand-new.md", "typed just now")),
+		"a path with no Y.Text is safe — binding seeds it from the buffer",
+	);
+
+	// A detached view has no path to compare, so it cannot be judged safe.
+	s.check(
+		!h.manager.canBindWithoutDivergence(partialOf<MarkdownView>({ file: null })),
+		"a view with no file is not safe to bind",
+	);
+
+	// A view mid-teardown throws out of editor.getValue(). This predicate runs
+	// inside sweeps that iterate every open leaf, so a throw here would abort
+	// the sweep and leave the remaining leaves unexamined. Same discipline as
+	// DiskMirror's hasFocusedEditorUnflushedChanges.
+	const throwingView = partialOf<MarkdownView>({
+		file: partialOf<TFile>({ path: IN_SCOPE }),
+		editor: partialOf<MarkdownView["editor"]>({
+			getValue: () => { throw new Error("view is being torn down"); },
+		}),
+	});
+	let threw = false;
+	let verdict = true;
+	try {
+		verdict = h.manager.canBindWithoutDivergence(throwingView);
+	} catch {
+		threw = true;
+	}
+	s.check(!threw, "a throwing editor does not propagate out of the predicate");
+	s.check(!verdict, "a throwing editor is reported as NOT safe to bind");
+
+	h.doc.destroy();
 }
 
 await s.done();
