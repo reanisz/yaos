@@ -78,13 +78,28 @@ enabled = true
 #      protects hostnames and CANNOT be placed in front of a workers.dev URL.
 #   2. Create a self-hosted Access application covering <your-domain>/admin
 #      and attach the policy that decides who may manage tokens.
-#   3. Copy the application's AUD tag (64 hex characters) into YAOS_ACCESS_AUD
-#      and your team domain into YAOS_ACCESS_TEAM_DOMAIN.
+#   3. Add both values as SECRETS on the Worker: dashboard → Settings →
+#      Variables and Secrets → type "Secret" (or `wrangler secret put
+#      YAOS_ACCESS_TEAM_DOMAIN`, then the same for YAOS_ACCESS_AUD).
+#
+# Secrets are the standard path, not the [vars] block below.  A dashboard-set
+# PLAINTEXT variable is removed by the next wrangler-driven deploy (deploys
+# replace the plaintext set with this file's [vars]); Secrets survive every
+# deploy.  And committed [vars] put deployment facts into the repo, which a
+# public deployment repo then publishes.  Neither value is a credential — the
+# Secret type is used for its deploy-surviving lifecycle, not its secrecy.
+# (Prefer dashboard Text variables?  Add `keep_vars = true` to your own copy
+# of this file so deploys stop removing them.  The template leaves that
+# default unchanged: it alters variable-sync semantics for every deploy, not
+# just this feature's.)
 #
 # The Worker verifies the Access JWT itself — signature against the team's
 # JWKS, issuer, and audience — so the script staying reachable on workers.dev,
 # where Access never runs, does not open the page: those requests carry no
 # valid token and are refused with 401.
+#
+# Alternative for a PRIVATE deployment repo — the Worker reads the same env
+# either way:
 #
 # [vars]
 # YAOS_ACCESS_TEAM_DOMAIN = "myteam.cloudflareaccess.com"

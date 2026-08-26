@@ -45,6 +45,11 @@ export interface Env {
 	 * rather than trusting the Cf-Access-Jwt-Assertion header, so a request that
 	 * reaches the same script directly on workers.dev — where Access never ran —
 	 * is refused.  See server/src/accessJwt.ts.
+	 *
+	 * Provide both values as Worker Secrets (dashboard → Settings → Variables
+	 * and Secrets, or `wrangler secret put`), not as committed [vars]: Secrets
+	 * survive wrangler-driven deploys and keep deployment facts out of the
+	 * repo.  See the setup comment in server/wrangler.toml.
 	 */
 	YAOS_ACCESS_TEAM_DOMAIN?: string;
 	/**

@@ -139,16 +139,16 @@ This is a deliberate limit. Env mode's defining property is that it makes **zero
 
 Managing vault tokens with `curl` and a bearer token works, but it is the same terminal step the claim flow exists to avoid. `/admin` is a server-rendered page — one document, no external assets, same style as the setup page — that lists the issued tokens and lets an operator issue, rotate and revoke them in a browser. An issued token is shown once, with a copy button, the `obsidian://` setup link and the mobile setup QR, so onboarding a vault from the admin page is the same one-scan flow the claim page offers.
 
-It is authenticated by **Cloudflare Access**, not by the bearer token, and it exists only where Access is configured:
+It is authenticated by **Cloudflare Access**, not by the bearer token, and it exists only where Access is configured through two Worker environment values: `YAOS_ACCESS_TEAM_DOMAIN` (the team domain, e.g. `myteam.cloudflareaccess.com`) and `YAOS_ACCESS_AUD` (the Access application's 64-hex AUD tag).
 
-```toml
-# server/wrangler.toml
-[vars]
-YAOS_ACCESS_TEAM_DOMAIN = "myteam.cloudflareaccess.com"
-YAOS_ACCESS_AUD = "<the Access application's 64-hex AUD tag>"
-```
+**Set them as Secrets, not as committed `[vars]`.** In the Cloudflare dashboard: Worker → **Settings → Variables and Secrets** → add both with type **Secret** — no terminal, same flow as adding the R2 binding. (From a terminal, `npx wrangler secret put YAOS_ACCESS_TEAM_DOMAIN`, then the same for the AUD.) Two reasons this is the standard path rather than editing `wrangler.toml`:
 
-**Both variables, or the feature does not exist.** With either absent or malformed, every `/admin` path returns the identical 404 JSON any unknown URL returns, before any Durable Object namespace is touched. Not 403, not a login redirect: a deployment that never opted in is byte-for-byte the server it was before. A half-configured deployment is treated as disabled and logs one `console.warn` naming the offending variable (once per isolate, because the 404 path is exactly what scanners hammer).
+- **Secrets survive deploys.** A dashboard-set *plaintext* variable is removed by the next `wrangler`-driven deploy, which replaces the plaintext variable set with whatever `wrangler.toml` declares — the classic way an admin page silently turns back into a 404 after an update. Deploys do not touch Secrets.
+- **Nothing environment-specific lands in the repository.** The team domain and AUD are deployment facts, not source, and YAOS deployments are usually driven from a Git repo (the Deploy button, the zero-ops updater). Committed `[vars]` publish those facts with the repo; Secrets keep the repo generic and fork-friendly.
+
+Committing `[vars]` to a private deployment repo still works — the Worker reads the same `env` either way, and `wrangler.toml` carries a commented example — but it is the alternative, not the default. Neither value is a credential; the Secret type is used here for its deploy-surviving lifecycle, not its secrecy. If you would rather manage them as plaintext **Text** variables in the dashboard, add `keep_vars = true` to your own `wrangler.toml` — without it, the next `wrangler`-driven deploy removes dashboard-set plaintext variables. The shipped template deliberately leaves that default unchanged, since it alters variable-sync semantics for the whole deployment.
+
+**Both values, or the feature does not exist.** With either absent or malformed, every `/admin` path returns the identical 404 JSON any unknown URL returns, before any Durable Object namespace is touched. Not 403, not a login redirect: a deployment that never opted in is byte-for-byte the server it was before. A half-configured deployment is treated as disabled and logs one `console.warn` naming the offending variable (once per isolate, because the 404 path is exactly what scanners hammer).
 
 #### The custom-domain requirement, and why the Worker verifies the JWT itself
 
