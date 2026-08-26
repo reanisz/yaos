@@ -229,21 +229,15 @@ export class EditorWorkspaceOrchestrator {
 			// pair, and it is diverged BECAUSE of the scope guards: while the path
 			// was excluded the user edited the buffer and the CRDT kept taking
 			// remote edits, with nothing reconciling them. y-codemirror does no
-			// initial sync, so binding here would map the next keystroke onto the
-			// wrong offset in the shared document.
+			// initial sync, so binding a mismatched pair would map the next
+			// keystroke onto the wrong offset in the shared document.
 			//
-			// Decline instead of picking a winner. Left unbound the file behaves
-			// as a normal local file, and because it is unbound reconcile's
-			// closed-file planner will see it and run the three-way decision that
-			// preserves both sides as a conflict artifact.
-			if (!editorBindings.canBindWithoutDivergence(leaf.view)) {
-				skipped += 1;
-				this.deps.log(
-					`Sync scope changed (${reason}) — "${path}" left unbound: editor and CRDT diverged while it was excluded`,
-				);
-				return;
-			}
-
+			// The refusal now lives in bind() itself, which arbitrates the
+			// divergence and re-binds once the two sides agree. This sweep goes
+			// through bindView unconditionally so that trackOpenFile still runs:
+			// an unbound, un-tracked path is NOT a safe resting state — a remote
+			// write would take DiskMirror's closed-file lane and force CRDT
+			// content over the diverged file within ~300ms.
 			this.bindView(leaf.view);
 
 			// Count only if the bind actually took. bind() legitimately refuses
@@ -255,6 +249,17 @@ export class EditorWorkspaceOrchestrator {
 			// to prevent.
 			if (editorBindings.getBindingHealthForView(leaf.view)?.bound) {
 				bound += 1;
+				return;
+			}
+
+			// Not bound. Report a divergence refusal separately from the other
+			// reasons bind() declines, so a sweep summary distinguishes "the user
+			// has two competing versions of this note" from "no CM view yet".
+			if (!editorBindings.canBindWithoutDivergence(leaf.view)) {
+				skipped += 1;
+				this.deps.log(
+					`Sync scope changed (${reason}) — "${path}" not yet bound: editor and CRDT diverged, arbitrating`,
+				);
 			}
 		});
 

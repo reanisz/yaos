@@ -766,6 +766,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
 				(path) => this.isMarkdownPathSyncable(path),
+				// Bind-time divergence arbiter. The controller owns the three tools
+				// arbitration needs — the disk-index baseline, the conflict-artifact
+				// writer and applyDiffToYText — and EditorBindingManager must not
+				// import it (the dependency already runs the other way).
+				(path, bufferContent) =>
+					this.reconciliationController.resolveEditorDivergenceForBind(path, bufferContent),
 			);
 
 			// 3. Global CM6 extension.
@@ -2111,7 +2117,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// editors from this one place is complete by construction. Optional
 		// chaining because the first call (load-settings) runs before the
 		// orchestrator exists.
-		this.editorWorkspace?.onSyncScopeChanged(reason);
+		//
+		// Gated on isReconciled like every other bind trigger (layout-change,
+		// active-leaf-change, file-open, the status tick). A settings save while
+		// startup reconcile is still running would otherwise bind open editors
+		// before reconcile has decided who wins on each path — the one ordering
+		// every other trigger is careful to avoid. The sweep re-runs on the next
+		// settings save, and onReconciled binds the open editors regardless.
+		// `?.` on the controller too: applyRuntimeSettings runs once from
+		// loadSettings, before createReconciliationController.
+		if (this.reconciliationController?.isReconciled) {
+			this.editorWorkspace?.onSyncScopeChanged(reason);
+		}
 		this.applyCursorVisibility();
 		void this.refreshFlightTraceState(reason);
 		this.trace("trace", "runtime-settings-applied", {

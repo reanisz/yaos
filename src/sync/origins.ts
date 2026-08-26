@@ -16,6 +16,20 @@ export const ORIGIN_DISK_SYNC = "disk-sync" as const;
 export const ORIGIN_DISK_SYNC_RECOVER_BOUND = "disk-sync-recover-bound" as const;
 export const ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER = "disk-sync-open-idle-recover" as const;
 export const ORIGIN_EDITOR_HEALTH_HEAL = "editor-health-heal" as const;
+/**
+ * Bind-time divergence arbitration imported the editor buffer into the CRDT.
+ *
+ * Deliberately a sibling of the ORIGIN_DISK_SYNC_* family rather than of
+ * ORIGIN_EDITOR_HEALTH_HEAL: the write happens while the path is UNBOUND, from
+ * the reconciliation controller, and downstream observers must treat it exactly
+ * as they treat a disk→CRDT import — local (so DiskMirror schedules no write of
+ * its own, since the content already agrees with what Obsidian is about to
+ * save) and never echoed back into an editor, because there is no binding to
+ * echo into yet. Naming it after the editor would be misleading; naming it
+ * `disk-sync` would collide with the external-edit path in traces, and telling
+ * the two apart is the whole point of having separate constants.
+ */
+export const ORIGIN_EDITOR_BIND_ARBITRATION = "editor-bind-arbitration" as const;
 
 /**
  * Internal set — not exported directly to prevent mutable cast-away access.
@@ -31,6 +45,7 @@ const LOCAL_STRING_ORIGIN_SET = new Set<string>([
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 	ORIGIN_EDITOR_HEALTH_HEAL,
+	ORIGIN_EDITOR_BIND_ARBITRATION,
 	ORIGIN_RESTORE,
 ]);
 

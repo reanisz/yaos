@@ -122,6 +122,56 @@ export interface BindingPropagationGate {
 	): void;
 }
 
+/**
+ * Result of one bind-time divergence arbitration.
+ *
+ * "resolved" is a claim that the editor buffer and the `Y.Text` now hold the
+ * same string. EditorBindingManager re-verifies it before binding anyway — see
+ * finishDivergenceArbitration — because an arbiter that returns "resolved"
+ * without converging would otherwise put us straight back into the corruption
+ * the arbitration exists to prevent, in a loop.
+ */
+export type BindDivergenceOutcome = "resolved" | "declined";
+
+/**
+ * Resolve a buffer-vs-CRDT divergence so `path` can be bound.
+ *
+ * Injected rather than reached for: arbitration needs the disk-index baseline,
+ * the conflict-artifact writer and `applyDiffToYText`, all of which live behind
+ * the reconciliation controller. EditorBindingManager must not import the
+ * controller (the controller already imports it), so the dependency is inverted
+ * into this one narrow async callback — which is also the seam the tests drive.
+ *
+ * `bufferContent` is the buffer as bind() read it. The implementation must not
+ * assume it is still current when it runs: it re-reads and re-verifies.
+ */
+export type BindDivergenceArbiter = (
+	path: string,
+	bufferContent: string,
+) => Promise<BindDivergenceOutcome>;
+
+/**
+ * How long a path whose arbitration failed is left alone.
+ *
+ * Reconcile sweeps call bind() for every open view on every pass. Without a
+ * backoff a path whose arbitration keeps failing — an unwritable conflict
+ * artifact directory, a vault adapter erroring — would re-arbitrate on every
+ * sweep, forever, each attempt doing real I/O.
+ */
+const DIVERGENCE_ARBITRATION_BACKOFF_MS = 30_000;
+
+/**
+ * Trace-safe description of a rejected promise's reason. Anything can be
+ * thrown, and stringifying a plain object yields "[object Object]" — which
+ * reads in a trace as though the reason was captured when it was not.
+ */
+function describeThrown(error: unknown): string | null {
+	if (error === null || error === undefined) return null;
+	if (error instanceof Error) return error.message;
+	if (typeof error === "string") return error;
+	return `non-error thrown (${typeof error})`;
+}
+
 export class EditorBindingManager {
 	/** The CM6 compartment that holds yCollab for each editor. */
 	readonly compartment = new Compartment();
@@ -146,6 +196,18 @@ export class EditorBindingManager {
 	 */
 	private lastCmResolveFailure: CmResolveFailure | null = null;
 
+	/**
+	 * Paths with an arbitration currently running. Bind attempts for a path in
+	 * this set return without action — concurrent reconcile sweeps must not each
+	 * start their own arbitration, and must not bind while one is mid-flight.
+	 */
+	private divergenceArbitrationInFlight = new Set<string>();
+	/**
+	 * path → earliest Date.now() at which arbitration may be attempted again
+	 * after a failure or a decline. See DIVERGENCE_ARBITRATION_BACKOFF_MS.
+	 */
+	private divergenceArbitrationRetryAfter = new Map<string, number>();
+
 	private readonly debug: boolean;
 
 	constructor(
@@ -162,6 +224,15 @@ export class EditorBindingManager {
 		 * construct without it keep their behaviour.
 		 */
 		private readonly isMarkdownPathSyncable: (path: string) => boolean = () => true,
+		/**
+		 * Bind-time divergence arbiter. Absent means "no arbiter wired": bind()
+		 * then DECLINES a diverged bind rather than attaching yCollab to a buffer
+		 * that does not match the Y.Text. Declining is the safe default and the
+		 * one an unconfigured harness gets — attaching would map the next
+		 * keystroke to a wrong offset in the shared document, and that corruption
+		 * replicates.
+		 */
+		private readonly resolveDivergenceForBind?: BindDivergenceArbiter,
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -234,12 +305,32 @@ export class EditorBindingManager {
 		// through here, e.g. updatePathsAfterRename rewriting a bound path into an
 		// excluded folder.
 		if (!this.isMarkdownPathSyncable(file.path)) {
+			this.traceOutOfScopeTeardown(view, file.path, "bind");
 			this.unbindByPath(file.path);
 			this.log(`bind: "${file.path}" outside sync scope, skipping`);
 			return;
 		}
 
 		const leafId = view.leaf.id ?? file.path;
+
+		// Divergence gate. bind() is the single door every bind trigger goes
+		// through — reconcileOpenEditors, validateOpenBindings, file-open,
+		// active-leaf-change, the onSyncScopeChanged sweep, and the async
+		// scheduleCmResolveRetry timer, which re-enters HERE rather than at
+		// applyBinding. Placing the gate above CM resolution means a path in
+		// arbitration does not also burn its CM-resolve retry budget.
+		//
+		// y-codemirror performs NO initial sync (see canBindWithoutDivergence),
+		// so a bind onto a mismatched buffer writes the user's next keystroke at
+		// a semantically wrong offset in the shared document. Startup is the
+		// common way to meet a mismatched pair: reconcile DEFERS open files
+		// (planClosedFileReconcile Rule 2, "open-or-bound"), then onReconciled
+		// binds them — including a note edited on disk while the plugin was
+		// unloaded.
+		if (!this.guardBindDivergence(view, file.path, deviceName, leafId)) {
+			return;
+		}
+
 		const cm = this.getCmView(view);
 		if (!cm) {
 			this.log(`bind: no CM EditorView for "${file.path}"`);
@@ -292,6 +383,27 @@ export class EditorBindingManager {
 		// Unbind previous if switching files in the same leaf
 		if (existing) {
 			this.unbind(view);
+
+			// Second gate, and it is not redundant. The gate at the top skipped
+			// its content check when this leaf already held a binding for this
+			// path, on the reasoning that re-attaching the SAME pair cannot change
+			// how offsets map. That reasoning ends here: everything below attaches
+			// yCollab to whatever `cm` getCmView just resolved, and the two routes
+			// that reach it are exactly the messy ones —
+			//
+			//   cm-changed  — `existing.cm !== cm`, so the buffer being bound is
+			//                 not the buffer the old binding was keeping in step
+			//                 with the Y.Text;
+			//   repair-fell-through — repair() failed to re-apply, and bind() is
+			//                 rebuilding the binding from scratch.
+			//
+			// The unbind above is what makes this call do real work: with the
+			// binding gone, guardBindDivergence no longer takes its already-bound
+			// shortcut, and a mismatch routes into arbitration instead of being
+			// attached. One string compare on a rare event.
+			if (!this.guardBindDivergence(view, file.path, deviceName, leafId)) {
+				return;
+			}
 		}
 
 		const target = this.resolveBindingTarget(
@@ -364,6 +476,7 @@ export class EditorBindingManager {
 			// path the user removed from sync. Tear it down instead; the refusal
 			// is deliberate, not a repair failure for a caller to retry.
 			if (!this.isMarkdownPathSyncable(file.path)) {
+				this.traceOutOfScopeTeardown(view, file.path, "repair-or-heal");
 				this.unbindByPath(file.path);
 				return true;
 			}
@@ -403,6 +516,7 @@ export class EditorBindingManager {
 			// path the user removed from sync. Tear it down instead; the refusal
 			// is deliberate, not a repair failure for a caller to retry.
 			if (!this.isMarkdownPathSyncable(file.path)) {
+				this.traceOutOfScopeTeardown(view, file.path, "repair-or-heal");
 				this.unbindByPath(file.path);
 				return true;
 			}
@@ -727,7 +841,251 @@ export class EditorBindingManager {
 		if (!file) return false;
 		const ytext = this.vaultSync.getTextForPath(file.path);
 		if (!ytext) return true;
-		return ytext.toJSON() === view.editor.getValue();
+		try {
+			return ytext.toJSON() === view.editor.getValue();
+		} catch {
+			// A view mid-teardown can throw out of `editor.getValue()`. This
+			// predicate is called from sweeps that iterate every open leaf, so an
+			// unhandled throw here aborts the whole sweep and leaves the remaining
+			// leaves unexamined. Same discipline as DiskMirror's
+			// hasFocusedEditorUnflushedChanges: an editor in flux is treated as
+			// "not safe", never as a reason to stop.
+			return false;
+		}
+	}
+
+	/**
+	 * Gate for bind(): true when the caller may proceed to attach yCollab.
+	 *
+	 * False means one of:
+	 *   - the buffer and the `Y.Text` disagree and an arbitration has just been
+	 *     kicked off (bind() is re-invoked when it converges),
+	 *   - an arbitration for this path is already in flight,
+	 *   - arbitration is in its post-failure backoff window,
+	 *   - there is no arbiter wired, or the buffer could not be read.
+	 *
+	 * In every one of those cases the correct action is to NOT bind and to NOT
+	 * retry in a loop. The caller's trackOpenFile is unaffected — the
+	 * orchestrator calls it after bind() regardless of the outcome, which is
+	 * load-bearing: without the path in DiskMirror's openPaths a remote write
+	 * takes the closed-file lane and force-writes CRDT content over the diverged
+	 * file within ~300ms (diskMirror.ts queueImmediateWrite / flushWrite), and
+	 * the getLastEditorActivityForPath guard that would normally hold it back
+	 * iterates BINDINGS, so it is dead for an unbound path.
+	 */
+	private guardBindDivergence(
+		view: MarkdownView,
+		path: string,
+		deviceName: string,
+		leafId: string,
+	): boolean {
+		// The harness gate deliberately holds a bound buffer and its Y.Text apart.
+		// Arbitration would "fix" the scenario out from under it.
+		if (this.bindingPropagationGate?.isPaused(path)) return true;
+
+		const ytext = this.vaultSync.getTextForPath(path);
+		// No Y.Text yet: binding seeds one FROM this buffer via ensureFile, so
+		// there is nothing to diverge from. This is the existing behaviour and the
+		// gate must not disturb it.
+		if (!ytext) return true;
+
+		// Already attached to this very buffer. bind() will no-op, repair, or
+		// re-attach the same pair; none of those changes how offsets map, and
+		// arbitration here would write into a Y.Text that yCollab is live on.
+		const existing = this.bindings.get(leafId);
+		if (existing && existing.path === path) return true;
+
+		let bufferContent: string;
+		try {
+			bufferContent = view.editor.getValue();
+		} catch (err) {
+			this.trace?.("editor", "binding-divergence-check-failed", {
+				path,
+				leafId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+
+		if (ytext.toJSON() === bufferContent) return true;
+
+		return this.beginDivergenceArbitration(view, path, deviceName, leafId, bufferContent);
+	}
+
+	/**
+	 * Start (or decline to start) arbitration for a diverged path. Always
+	 * returns false — the current bind attempt never proceeds. When arbitration
+	 * succeeds it re-invokes bind() itself.
+	 */
+	private beginDivergenceArbitration(
+		view: MarkdownView,
+		path: string,
+		deviceName: string,
+		leafId: string,
+		bufferContent: string,
+	): false {
+		if (this.divergenceArbitrationInFlight.has(path)) {
+			this.trace?.("editor", "binding-divergence-arbitration-skipped", {
+				path,
+				leafId,
+				reason: "in-flight",
+			});
+			return false;
+		}
+
+		const retryAfter = this.divergenceArbitrationRetryAfter.get(path) ?? 0;
+		const now = Date.now();
+		if (now < retryAfter) {
+			this.trace?.("editor", "binding-divergence-arbitration-skipped", {
+				path,
+				leafId,
+				reason: "backoff",
+				retryInMs: retryAfter - now,
+			});
+			return false;
+		}
+
+		const arbiter = this.resolveDivergenceForBind;
+		if (!arbiter) {
+			this.trace?.("editor", "binding-divergence-declined", {
+				path,
+				leafId,
+				reason: "no-arbiter",
+			});
+			this.log(
+				`bind: "${path}" left unbound — editor buffer and CRDT diverged and no arbiter is wired`,
+			);
+			// Backoff even here: without it every sweep re-traces the same refusal.
+			this.divergenceArbitrationRetryAfter.set(path, now + DIVERGENCE_ARBITRATION_BACKOFF_MS);
+			return false;
+		}
+
+		this.divergenceArbitrationInFlight.add(path);
+		this.trace?.("editor", "binding-divergence-arbitration-started", {
+			path,
+			leafId,
+			bufferLength: bufferContent.length,
+			crdtLength: this.vaultSync.getTextForPath(path)?.toJSON().length ?? null,
+		});
+		this.log(`bind: arbitrating editor/CRDT divergence for "${path}" before binding`);
+
+		void arbiter(path, bufferContent)
+			.then((outcome) => {
+				this.finishDivergenceArbitration(view, path, deviceName, leafId, outcome, null);
+			})
+			.catch((err: unknown) => {
+				this.finishDivergenceArbitration(view, path, deviceName, leafId, "declined", err);
+			});
+
+		return false;
+	}
+
+	/**
+	 * Land an arbitration result. Re-binds only after re-verifying convergence
+	 * ourselves, which is what bounds the recursion: bind() → arbitration →
+	 * bind() can only happen when the buffer and the `Y.Text` now hold the same
+	 * string, and in that state the gate above passes without arbitrating again.
+	 */
+	private finishDivergenceArbitration(
+		view: MarkdownView,
+		path: string,
+		deviceName: string,
+		leafId: string,
+		outcome: BindDivergenceOutcome,
+		error: unknown,
+	): void {
+		this.divergenceArbitrationInFlight.delete(path);
+
+		if (outcome !== "resolved") {
+			this.divergenceArbitrationRetryAfter.set(
+				path,
+				Date.now() + DIVERGENCE_ARBITRATION_BACKOFF_MS,
+			);
+			this.trace?.("editor", "binding-divergence-declined", {
+				path,
+				leafId,
+				reason: error ? "arbiter-threw" : "arbiter-declined",
+				error: describeThrown(error),
+				retryAfterMs: DIVERGENCE_ARBITRATION_BACKOFF_MS,
+			});
+			this.log(
+				`bind: "${path}" left unbound — divergence arbitration declined ` +
+				`(retry not before ${DIVERGENCE_ARBITRATION_BACKOFF_MS}ms)`,
+			);
+			return;
+		}
+
+		// The view may have been closed or switched to another file while the
+		// arbitration was running.
+		if (view.file?.path !== path) {
+			this.trace?.("editor", "binding-divergence-resolved-view-gone", {
+				path,
+				leafId,
+				nowShowing: view.file?.path ?? null,
+			});
+			this.divergenceArbitrationRetryAfter.delete(path);
+			return;
+		}
+
+		// Independent convergence check. An arbiter that reports "resolved"
+		// without converging must not be trusted into a rebind: bind() would
+		// re-detect the divergence, start another arbitration, and loop.
+		const ytext = this.vaultSync.getTextForPath(path);
+		let converged: boolean;
+		try {
+			converged = !ytext || ytext.toJSON() === view.editor.getValue();
+		} catch {
+			converged = false;
+		}
+		if (!converged) {
+			this.divergenceArbitrationRetryAfter.set(
+				path,
+				Date.now() + DIVERGENCE_ARBITRATION_BACKOFF_MS,
+			);
+			this.trace?.("editor", "binding-divergence-declined", {
+				path,
+				leafId,
+				reason: "still-diverged-after-arbitration",
+				retryAfterMs: DIVERGENCE_ARBITRATION_BACKOFF_MS,
+			});
+			return;
+		}
+
+		this.divergenceArbitrationRetryAfter.delete(path);
+		this.trace?.("editor", "binding-divergence-resolved", { path, leafId });
+		this.bind(view, deviceName);
+	}
+
+	/**
+	 * Record what an out-of-scope teardown is about to drop.
+	 *
+	 * The trade is accepted — dropping unflushed editor→CRDT content is the
+	 * point of excluding a path, the bytes are still on disk, and other devices
+	 * keep the last-synced version — but it must be observable. Without this the
+	 * only evidence a user's in-flight edit stopped propagating is the absence of
+	 * a trace.
+	 */
+	private traceOutOfScopeTeardown(view: MarkdownView, path: string, action: string): void {
+		if (!this.isBound(path)) return;
+		const ytext = this.vaultSync.getTextForPath(path);
+		let unflushedChars: number | null = null;
+		try {
+			const buffer = view.editor.getValue();
+			const crdt = ytext?.toJSON() ?? null;
+			unflushedChars = crdt === null || crdt === buffer ? 0 : buffer.length - crdt.length;
+		} catch {
+			// View mid-teardown: report "unknown" rather than abort the teardown.
+		}
+		this.trace?.("editor", "binding-out-of-scope-teardown", {
+			path,
+			action,
+			unflushedChars,
+			contentAtRisk: unflushedChars === null ? null : unflushedChars !== 0,
+		});
+		this.log(
+			`${action}: tearing down out-of-scope binding for "${path}" — ` +
+			`unflushed editor→CRDT content is dropped (still on disk)`,
+		);
 	}
 
 	/**
