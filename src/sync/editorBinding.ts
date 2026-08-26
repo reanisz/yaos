@@ -155,6 +155,13 @@ export class EditorBindingManager {
 		private trace?: TraceRecord,
 		private recordFlightPathEvent?: (event: ProductFlightPathEventInput) => void,
 		private readonly bindingPropagationGate?: BindingPropagationGate,
+		/**
+		 * Markdown sync-scope predicate, supplied by the plugin so binding sees
+		 * the live `Exclude paths` setting rather than a snapshot. Defaults to
+		 * "everything is in scope" so existing call sites and test harnesses that
+		 * construct without it keep their behaviour.
+		 */
+		private readonly isMarkdownPathSyncable: (path: string) => boolean = () => true,
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -216,6 +223,22 @@ export class EditorBindingManager {
 
 		// Only bind .md files
 		if (!file.path.endsWith(".md")) return;
+
+		// resolveBindingTarget is the load-bearing gate; this one short-circuits
+		// before getCmView and scheduleCmResolveRetry below, and puts the refusal
+		// where a reader looks for it.
+		//
+		// It tears down first. Returning above the `if (existing) this.unbind(...)`
+		// below would otherwise mean bind() can no longer clear a stale binding on
+		// an out-of-scope path — and a binding CAN arrive at one without passing
+		// through here, e.g. updatePathsAfterRename rewriting a bound path into an
+		// excluded folder.
+		if (!this.isMarkdownPathSyncable(file.path)) {
+			this.traceOutOfScopeTeardown(view, file.path, "bind");
+			this.unbindByPath(file.path);
+			this.log(`bind: "${file.path}" outside sync scope, skipping`);
+			return;
+		}
 
 		const leafId = view.leaf.id ?? file.path;
 		const cm = this.getCmView(view);
@@ -336,6 +359,16 @@ export class EditorBindingManager {
 			`repair:${reason}`,
 		);
 		if (!target) {
+			// An out-of-scope path is not hard-tombstoned, so the fallback below
+			// would report "not repaired" and leave the existing entry in
+			// this.bindings with yCollab still attached — a live CRDT binding on a
+			// path the user removed from sync. Tear it down instead; the refusal
+			// is deliberate, not a repair failure for a caller to retry.
+			if (!this.isMarkdownPathSyncable(file.path)) {
+				this.traceOutOfScopeTeardown(view, file.path, "repair-or-heal");
+				this.unbindByPath(file.path);
+				return true;
+			}
 			return this.isHardTombstonedPath(file.path);
 		}
 
@@ -366,6 +399,16 @@ export class EditorBindingManager {
 			`heal:${reason}`,
 		);
 		if (!target) {
+			// An out-of-scope path is not hard-tombstoned, so the fallback below
+			// would report "not repaired" and leave the existing entry in
+			// this.bindings with yCollab still attached — a live CRDT binding on a
+			// path the user removed from sync. Tear it down instead; the refusal
+			// is deliberate, not a repair failure for a caller to retry.
+			if (!this.isMarkdownPathSyncable(file.path)) {
+				this.traceOutOfScopeTeardown(view, file.path, "repair-or-heal");
+				this.unbindByPath(file.path);
+				return true;
+			}
 			return this.isHardTombstonedPath(file.path);
 		}
 
@@ -658,6 +701,38 @@ export class EditorBindingManager {
 			if (binding.path === path) return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Record what an out-of-scope teardown is about to drop.
+	 *
+	 * The trade is accepted — dropping unflushed editor→CRDT content is the
+	 * point of excluding a path, the bytes are still on disk, and other devices
+	 * keep the last-synced version — but it must be observable. Without this the
+	 * only evidence a user's in-flight edit stopped propagating is the absence of
+	 * a trace.
+	 */
+	private traceOutOfScopeTeardown(view: MarkdownView, path: string, action: string): void {
+		if (!this.isBound(path)) return;
+		const ytext = this.vaultSync.getTextForPath(path);
+		let unflushedChars: number | null = null;
+		try {
+			const buffer = view.editor.getValue();
+			const crdt = ytext?.toJSON() ?? null;
+			unflushedChars = crdt === null || crdt === buffer ? 0 : buffer.length - crdt.length;
+		} catch {
+			// View mid-teardown: report "unknown" rather than abort the teardown.
+		}
+		this.trace?.("editor", "binding-out-of-scope-teardown", {
+			path,
+			action,
+			unflushedChars,
+			contentAtRisk: unflushedChars === null ? null : unflushedChars !== 0,
+		});
+		this.log(
+			`${action}: tearing down out-of-scope binding for "${path}" — ` +
+			`unflushed editor→CRDT content is dropped (still on disk)`,
+		);
 	}
 
 	/**
@@ -1413,6 +1488,30 @@ export class EditorBindingManager {
 	): BindingTarget | null {
 		const file = view.file;
 		if (!file) return null;
+
+		// Scope gate. This sits at the top deliberately, ABOVE the existingText
+		// short circuit below, because the two cases leak in opposite directions
+		// and both have to be refused:
+		//
+		//   already in the CRDT (excluded after it had synced) — binding would
+		//     pipe remote edits straight into the editor buffer, which Obsidian
+		//     then persists. That is the same overwrite DiskMirror now refuses,
+		//     arriving by a route DiskMirror never sees.
+		//
+		//   not in the CRDT — ensureFile() below would ADMIT the file, seeded
+		//     from the editor buffer. An excluded note would start syncing
+		//     merely because the user opened it.
+		//
+		// This method is the sole door to ensureFile and the sole producer of
+		// every BindingTarget, so one gate covers bind(), repair() and heal().
+		// All three already handle a null target.
+		if (!this.isMarkdownPathSyncable(file.path)) {
+			this.trace?.("editor", "binding-blocked-out-of-scope", {
+				path: file.path,
+				reason,
+			});
+			return null;
+		}
 
 		const existingText = this.vaultSync.getTextForPath(file.path);
 		if (existingText) {

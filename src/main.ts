@@ -405,6 +405,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getSettings: () => this.settings,
 			getEditorBindings: () => this.editorBindings,
 			getDiskMirror: () => this.diskMirror,
+			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			maybeImportDeferredClosedOnlyPath: (path, reason) =>
 				this.reconciliationController.maybeImportDeferredClosedOnlyPath(path, reason),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
@@ -764,6 +765,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(source, msg, details) => this.trace(source, msg, details),
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
+				(path) => this.isMarkdownPathSyncable(path),
 			);
 
 			// 3. Global CM6 extension.
@@ -2104,6 +2106,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
+		// Sole assignment site for excludePatterns, and every path that can change
+		// the setting funnels through here — so re-applying scope to the open
+		// editors from this one place is complete by construction. Optional
+		// chaining because the first call (load-settings) runs before the
+		// orchestrator exists.
+		//
+		// Gated on isReconciled like every other bind trigger (layout-change,
+		// active-leaf-change, file-open, the status tick). A settings save while
+		// startup reconcile is still running would otherwise bind open editors
+		// before reconcile has decided who wins on each path — the one ordering
+		// every other trigger is careful to avoid. The sweep re-runs on the next
+		// settings save, and onReconciled binds the open editors regardless.
+		// `?.` on the controller too: applyRuntimeSettings runs once from
+		// loadSettings, before createReconciliationController.
+		if (this.reconciliationController?.isReconciled) {
+			this.editorWorkspace?.onSyncScopeChanged(reason);
+		}
 		this.applyCursorVisibility();
 		void this.refreshFlightTraceState(reason);
 		this.trace("trace", "runtime-settings-applied", {
