@@ -48,15 +48,24 @@
  */
 
 import { verifyAccessJwt, type AccessConfig } from "../accessJwt";
-import { normalizeVaultId, normalizeVaultTokenLabel, type StoredServerConfig } from "../config";
+import {
+	normalizeStrictTokenId,
+	normalizeStrictTokenLabel,
+	normalizeVaultId,
+	normalizeVaultTokenLabel,
+	type StoredServerConfig,
+} from "../config";
 import { renderAdminPage } from "../adminPage";
 import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
 import { getAuthStateCached } from "./auth";
 import { html, json } from "./http";
 import type { AuthStateCached, Env } from "./types";
 import {
+	issueStrictToken,
 	issueVaultToken,
+	listStrictTokens,
 	listVaultTokens,
+	revokeStrictToken,
 	revokeVaultToken,
 } from "./vaultTokens";
 
@@ -129,14 +138,32 @@ function adminHtml(body: string): Response {
  * audit" — so it is greppable out of the request log it shares the channel
  * with.
  */
-function logAdminAudit(action: "issue" | "revoke", vaultId: string, actor: string): void {
+function logAdminAudit(
+	action: "issue" | "revoke",
+	vaultId: string,
+	actor: string,
+	tokenId?: string,
+): void {
 	console.debug(
 		`${LOG_PREFIX} admin audit: `
-		+ JSON.stringify({ action, vaultIdHint: vaultId.slice(0, 8), actor }),
+		// `tokenIdHint` is present only in strict mode, where a vault holds
+		// several tokens and the vaultId alone does not say which one moved.
+		// JSON.stringify drops an undefined value, so a claim-mode line is
+		// byte-identical to the one this function has always emitted.  The
+		// tokenId is truncated for the same reason the vaultId is: an audit log
+		// is exported, and a full handle in it is a correlation handle.
+		+ JSON.stringify({
+			action,
+			vaultIdHint: vaultId.slice(0, 8),
+			tokenIdHint: tokenId === undefined ? undefined : tokenId.slice(0, 8),
+			actor,
+		}),
 	);
 }
 
-async function readAdminBody(req: Request): Promise<{ vaultId?: unknown; label?: unknown } | null> {
+async function readAdminBody(
+	req: Request,
+): Promise<{ vaultId?: unknown; label?: unknown; tokenId?: unknown } | null> {
 	try {
 		return await req.json();
 	} catch {
@@ -152,29 +179,55 @@ async function readAdminBody(req: Request): Promise<{ vaultId?: unknown; label?:
  * answers 409 exactly as the bearer-token API does.  An unclaimed server has
  * no operator yet, so there is nothing to issue against.
  *
- * Returns the stored config on success rather than a boolean, so the caller
- * that needs it cannot re-derive it from a state the gate has not narrowed.
+ * STRICT MODE is admitted regardless of claim state, and that is the single
+ * most load-bearing line of the feature.  In strict mode /admin is the ONLY
+ * surface that can issue a credential, so gating it on a claim would mean a
+ * fresh deployment had to first perform the claim flow that strict mode has
+ * closed — a server that can never be given its first token.  The claim state
+ * of a strict server is simply not a fact about whether it can be managed.
+ *
+ * Env-plus-strict cannot reach here as env: getAuthStateCached resolves strict
+ * first (fail closed), so `mode === "env"` below means strict is off.
+ *
+ * Returns the mode alongside the stored config, so a caller cannot act on a
+ * state the gate has not narrowed — and cannot mistake one mode's store for
+ * the other's.
  */
-type ClaimModeGate =
-	| { ok: true; config: StoredServerConfig }
+type ManagementGate =
+	| { ok: true; mode: "claim" | "strict"; config: StoredServerConfig }
 	| { ok: false; response: Response };
 
-function requireClaimMode(authState: AuthStateCached): ClaimModeGate {
+function requireManageableMode(authState: AuthStateCached): ManagementGate {
+	if (authState.mode === "strict") {
+		return { ok: true, mode: "strict", config: authState.config };
+	}
 	if (authState.mode === "env") {
 		return { ok: false, response: json({ error: "unsupported_in_env_mode" }, 409) };
 	}
 	if (!authState.claimed) {
 		return { ok: false, response: json({ error: "unclaimed" }, 503) };
 	}
-	return { ok: true, config: authState.config };
+	return { ok: true, mode: "claim", config: authState.config };
 }
 
 function handleAdminList(authState: AuthStateCached): Response {
-	const gate = requireClaimMode(authState);
+	const gate = requireManageableMode(authState);
 	if (!gate.ok) return gate.response;
 	// Served from the config getAuthStateCached already fetched — no extra DO
-	// call, and never a hash: listVaultTokens projects the map explicitly.
-	return json({ ok: true, vaultTokens: listVaultTokens(gate.config) });
+	// call, and never a hash: both list functions project their map explicitly.
+	//
+	// One response key for both modes.  The entries differ (a strict one
+	// carries tokenId and a required label), but a client that reads
+	// `vaultTokens` as "the tokens this server holds" is right in both, and a
+	// second key would make the page's fetch depend on a mode it already knows
+	// from the rendered shell.
+	return json({
+		ok: true,
+		strictPermissions: gate.mode === "strict",
+		vaultTokens: gate.mode === "strict"
+			? listStrictTokens(gate.config)
+			: listVaultTokens(gate.config),
+	});
 }
 
 async function handleAdminIssue(
@@ -184,44 +237,84 @@ async function handleAdminIssue(
 	authState: AuthStateCached,
 	actor: string,
 ): Promise<Response> {
-	const gate = requireClaimMode(authState);
+	const gate = requireManageableMode(authState);
 	if (!gate.ok) return gate.response;
 
 	const body = await readAdminBody(req);
 	if (body === null) return json({ error: "invalid json" }, 400);
 
 	let vaultId: string;
+	// Strict mode requires a device name; claim mode keeps the optional note it
+	// has always had.  The two normalizers differ on exactly that, so which one
+	// runs is the whole of the difference.
 	let label: string | null;
 	try {
 		vaultId = normalizeVaultId(body.vaultId);
-		label = normalizeVaultTokenLabel(body.label);
+		label = gate.mode === "strict"
+			? normalizeStrictTokenLabel(body.label)
+			: normalizeVaultTokenLabel(body.label);
 	} catch (err) {
 		return json({ error: err instanceof Error ? err.message : "invalid request" }, 400);
+	}
+
+	// One issue path per mode, both reused verbatim from routes/vaultTokens.ts
+	// so the two front doors cannot drift.  `label` is non-null on the strict
+	// branch by construction — normalizeStrictTokenLabel throws rather than
+	// returning null — and the fallback is spelled out so a reader does not have
+	// to re-derive that from the normalizer.
+	//
+	// Written as two branches rather than one expression over the union so that
+	// the strict `tokenId` is reached by narrowing rather than by a cast; the
+	// part that follows an issue is shared in respondToIssuedToken.
+	if (gate.mode === "strict") {
+		const issued = await issueStrictToken(env, origin, vaultId, label ?? "");
+		if (!issued.ok) {
+			return json({ error: issued.failure.error }, issued.failure.status);
+		}
+		return await respondToIssuedToken(origin, vaultId, actor, issued.issued, issued.issued.tokenId);
 	}
 
 	const issued = await issueVaultToken(env, origin, vaultId, label);
 	if (!issued.ok) {
 		return json({ error: issued.failure.error }, issued.failure.status);
 	}
-	// Audited here rather than after the QR step: the rotation is durable as of
+	return await respondToIssuedToken(origin, vaultId, actor, issued.issued, undefined);
+}
+
+/**
+ * Audit, render the QR, and answer — the half of an issue that is identical in
+ * both modes.
+ *
+ * `issued` is spread into the response, so each mode's fields reach the page
+ * unchanged: `tokenId` in strict mode, and nothing extra in claim mode, which
+ * keeps the claim-mode response byte-identical to what it has always been.
+ */
+async function respondToIssuedToken(
+	origin: string,
+	vaultId: string,
+	actor: string,
+	issued: { token: string },
+	tokenId: string | undefined,
+): Promise<Response> {
+	// Audited here rather than after the QR step: the write is durable as of
 	// this line, and an audit trail that skipped a mutation whose cosmetic
 	// follow-up failed would be worse than none.
-	logAdminAudit("issue", vaultId, actor);
+	logAdminAudit("issue", vaultId, actor, tokenId);
 
-	// The rotation is already durable, so a QR failure must not become a lost
+	// The write is already durable, so a QR failure must not become a lost
 	// token: the plaintext is deliverable exactly once and this response is that
 	// once.  The QR is a convenience for mobile onboarding, so it degrades to
 	// null and the page falls back to the deep link and the copy button.
 	let mobileSetupQrDataUrl: string | null = null;
 	try {
 		mobileSetupQrDataUrl = await renderSetupQrDataUrl(
-			buildMobileSetupUrl(origin, issued.issued.token, vaultId),
+			buildMobileSetupUrl(origin, issued.token, vaultId),
 		);
 	} catch (err) {
 		console.warn(`${LOG_PREFIX} admin setup QR rendering failed:`, err);
 	}
 
-	return json({ ok: true, ...issued.issued, mobileSetupQrDataUrl });
+	return json({ ok: true, ...issued, mobileSetupQrDataUrl });
 }
 
 async function handleAdminRevoke(
@@ -230,11 +323,36 @@ async function handleAdminRevoke(
 	authState: AuthStateCached,
 	actor: string,
 ): Promise<Response> {
-	const gate = requireClaimMode(authState);
+	const gate = requireManageableMode(authState);
 	if (!gate.ok) return gate.response;
 
 	const body = await readAdminBody(req);
 	if (body === null) return json({ error: "invalid json" }, 400);
+
+	// Strict mode revokes one DEVICE, so its handle is the tokenId; claim mode
+	// revokes a vault's only token, so its handle is the vaultId.  Same route
+	// shape, different body key — the classifier is untouched either way.
+	if (gate.mode === "strict") {
+		let tokenId: string;
+		try {
+			tokenId = normalizeStrictTokenId(body.tokenId);
+		} catch (err) {
+			return json({ error: err instanceof Error ? err.message : "invalid request" }, 400);
+		}
+
+		// Resolved BEFORE the revoke, from the config the gate already holds:
+		// afterwards the record is gone and the trail could no longer say which
+		// vault lost a device.  An unknown tokenId leaves the hint empty, which
+		// is the honest record of a revoke that removed nothing.
+		const vaultId = gate.config.strictTokens?.[tokenId]?.vaultId ?? "";
+
+		const revoked = await revokeStrictToken(env, tokenId);
+		if (!revoked.ok) {
+			return json({ error: revoked.failure.error }, revoked.failure.status);
+		}
+		logAdminAudit("revoke", vaultId, actor, tokenId);
+		return json({ ok: true, existed: revoked.existed });
+	}
 
 	let vaultId: string;
 	try {
@@ -317,6 +435,13 @@ export async function handleAdminRoute(
 			// that is unclaimed, or running in env mode, needs to be told why
 			// there is no form rather than shown a broken one.
 			return adminHtml(renderAdminPage({ host: url.origin, authMode: authState.mode }));
+		// ROUTE-SHAPE INVARIANT (see the SECURITY/BILLING checklist in
+		// server/src/index.ts): strict mode adds no route and changes no
+		// method+pathname pair.  The same four shapes classifyWorkerRoute
+		// already knows — GET /admin, GET|POST /admin/api/vault-tokens, POST
+		// /admin/api/vault-tokens/revoke — carry both modes, differing only in
+		// the JSON body of the revoke call.  The classifier therefore needs no
+		// change, and no new trap-env shape test is owed.
 		case "list":
 			return handleAdminList(authState);
 		case "issue":

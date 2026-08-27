@@ -180,9 +180,87 @@ A successful issue or revoke **through the admin front door** logs one line:
 
 It is emitted on `console.debug`, the channel the per-request access log already uses, and is self-identifying — grep `admin audit`. `actor` is the Access token's `email`, falling back to `sub`, then to `"unknown"`. It is logged in full — a truncated identity is not an audit record — while the `vaultId` keeps the repo's eight-character truncation so it cannot become a correlation handle in exported logs. The token and the label are never logged, and nothing is logged for reads, rejected input, or failed authentication beyond the rejection warning above. The bearer-token API emits no such line and cannot: its caller is an anonymous secret, so there is no identity to record.
 
+## strict_permissions mode
+
+Everything above rests on one credential that opens everything. The claimed token authorizes every vault, every operator route, and the management API that mints per-vault tokens. Per-vault tokens narrow what a *device* holds, but they do not narrow what the *server* will accept: the global token still opens every vault beside them, so the blast radius of that one string is the whole deployment. For a single operator syncing their own vaults that is the right trade. For a deployment that hosts vaults across a real trust boundary, it means the strongest statement you can make about a vault is "everyone with the operator token can read it", and the operator token is the one credential that has to exist on the longest-lived machine you own.
+
+**Strict permissions mode severs that.** Set `YAOS_STRICT_PERMISSIONS` to any non-empty value and the server-wide credential stops existing:
+
+```toml
+# server/wrangler.toml — or, preferably, a Worker Secret
+[vars]
+YAOS_STRICT_PERMISSIONS = "1"
+```
+
+With the variable unset — the default, and what every existing deployment does — nothing above changes in any respect.
+
+### What the mode actually is
+
+| | Default | Strict |
+| --- | --- | --- |
+| Claimed token | opens every vault, manages tokens | authorizes **nothing** |
+| `SYNC_TOKEN` | opens every vault | **ignored**, with a warning |
+| `POST /claim` | the setup flow | `403 strict_permissions` |
+| Vault credential | one token per vault (optional label) | 0..N tokens per vault, one **per device**, label required |
+| Bearer operator API | the management surface | `403 strict_permissions` |
+| `/admin` | manages tokens on a *claimed* server | the **only** management surface, works unclaimed |
+| Ticket signing key | derived from the token hash | a dedicated random secret |
+
+### The per-device token model
+
+A strict token is scoped to one `vaultId` and named for one device. Issuing a second token for the same vault **adds** it — this is the deep difference from the default mode, where re-issuing *rotates* and silently logs out whatever held the old one. Onboarding a laptop must not disconnect the phone, so append is the only sane default once a vault has more than one device.
+
+That is also why the label is **required** here and optional in the default mode. With one token per vault the label is a note; with several, it is the only handle you have for deciding which token to revoke. A device you cannot name is a token you will never dare remove.
+
+Revocation is therefore by `tokenId` — a short random handle, returned when the token is issued and listed in the admin page — rather than by `vaultId`. Revoking one device leaves the vault's other devices connected.
+
+**Reusing one token across several devices is discouraged, not prevented.** The server cannot tell devices apart: a token is a token, and enforcing one-device-per-token would mean pinning a credential to a fingerprint the server has no reliable way to observe. What it costs you is precision — revoking a shared token logs out every device using it, and the label stops describing anything. Issue one per device; the cap is 300 across the whole server, which is not the constraint that will bite you.
+
+### The claim route is closed from the environment alone
+
+`POST /claim` answers `403 {"error":"strict_permissions"}`, and the decision is made **before any Durable Object access**. That ordering is a hard invariant, not an optimisation: `/claim` is an unauthenticated POST, so deciding it from a stored value would let anyone on the internet wake the config Durable Object once per request — the amplification issue #40 removed. The check reads one environment string. A trap-env regression test asserts that a refused claim touches neither `YAOS_CONFIG` nor `YAOS_SYNC`.
+
+The home page follows: in strict mode `/` renders an informational page instead of the claim UI, whatever the server's claim state, because a claim button that posts to a 403 is worse than no button.
+
+### `/admin` is the bootstrap, and it works on a never-claimed server
+
+In the default mode the admin API requires claim mode — there is no operator until someone claims. In strict mode that requirement is inverted and would be fatal: `/admin` is the only surface that can issue a credential, so gating it on a claim would produce a server that can never be given its first token. **The strict admin surface therefore works regardless of claim state**, and a fresh deployment's bootstrap is: deploy → set the variable → sign in through Access → issue the first device token.
+
+The route shapes are unchanged. `GET /admin`, `GET|POST /admin/api/vault-tokens` and `POST /admin/api/vault-tokens/revoke` carry both modes; only the revoke body differs (`{tokenId}` in strict, `{vaultId}` otherwise), and the listing entries gain `tokenId` and a non-null `label`. The response also carries `strictPermissions`, so a client never has to infer the mode. Everything else — the Access JWT verification, the CSRF posture, the 415 on a non-JSON POST, the shown-once token panel, the audit line — is identical; the strict audit line adds a truncated `tokenIdHint`, because with several tokens per vault the vault ID alone no longer says which one moved.
+
+### Env interactions
+
+**`SYNC_TOKEN` set alongside strict mode: strict wins, and the token is ignored.** Fail closed is the only defensible resolution — the alternative hands back the server-wide credential the mode exists to remove — but an operator who set both almost certainly believes the token still works, so the server logs one `console.warn` per isolate saying it does not. The token itself is never echoed.
+
+**Cloudflare Access unconfigured: everything still fails closed, and the server says so.** Existing strict tokens keep working; what becomes impossible is issuing a new one, since `/admin` does not exist without the Access variables. A deployment in that state with no tokens yet has locked itself out, so it logs one `console.warn` per isolate naming the risk. In practice, **strict mode requires Access**, and it should be configured before the variable is set. See the Access setup above; both values belong in Worker Secrets.
+
+### The ticket signing secret
+
+Strict mode has no server-wide secret to derive a WebSocket ticket key from, and signing with any one device's token would tie every ticket's lifetime to that device. It therefore uses a dedicated random secret — 32 bytes, base64url, stored in the config Durable Object — which is the first item under **Planned hardening** below, implemented for this mode. Tickets in strict mode are no longer signed with a value that is elsewhere a token *verifier*; the other two modes keep their existing derivation untouched.
+
+The secret is created **lazily, by the first ticket issuance**, through a get-or-create endpoint on the config DO, and is never rotated by this code. Issuance is an authenticated and comparatively rare operation — the plugin caches a ticket for its 5-minute TTL — so the one extra Durable Object round-trip that first time is a cost nothing else pays. Creating it at boot, or on the auth path, would put a write in front of requests that do not need one. There is a one-time consequence worth knowing: the isolate that creates the secret invalidates its own config cache immediately, while other isolates converge within `AUTH_CONFIG_CACHE_TTL_MS`, so the very first ticket a deployment ever issues may not verify on another isolate for up to 60 seconds. An ordinary reconnect resolves it, and it cannot recur.
+
+**The secret must never leave the server.** It is carried in `StoredServerConfig` because the Worker signs with it, and the thing that keeps it server-side is that no HTTP response ever returns a `StoredServerConfig` verbatim — `getCapabilities` builds an explicit field-by-field projection, and every other response is assembled the same way. The regression is asserted on the *raw text* of `/`, `/api/capabilities`, the `/admin` page, the admin JSON responses, the ticket response and the claim response, because the failure this guards against is a stray spread, which no field-by-field check would catch.
+
+### `authMode` reports `"claim"`, deliberately
+
+`GET /api/capabilities` on a strict server reports `authMode: "claim"` plus an additive `strictPermissions: true`. This is a **compatibility shim** and it is load-bearing.
+
+The plugin's capabilities validator (`isServerCapabilities` in `src/runtime/capabilityUpdateService.ts`) hard-enumerates `authMode` as `env | claim | unclaimed`, and an unrecognised value invalidates the *whole* payload — the plugin then treats the server as unreachable rather than as one it partly understands. Unknown *extra* fields, by contrast, pass that validator untouched. So the mode travels as the additive flag, and `authMode` carries the nearest true statement about how a client authenticates: a bearer token verified against a hash in the config Durable Object, which is claim mode's contract and exactly what a strict device token does. The field a client acts on is never a lie; the field it cannot parse is never sent.
+
+`strictPermissions` is emitted in every mode — `false` when off — so a client never has to distinguish "absent" from "disabled". The shim can be dropped once the minimum supported plugin version accepts `"strict"`; a test asserts the plugin still hard-enumerates the field, so the day that changes is visible.
+
+### Fork-local note: why the storage is separate
+
+Strict tokens live in their own `strictTokens` map in the config Durable Object, keyed by `tokenId`, deliberately **not** unified with the existing one-token-per-vault `vaultTokens` map. The two stores are never consulted together: the default mode reads only `vaultTokens`, strict mode reads only `strictTokens`.
+
+This is a fork-local decision, taken to minimise rebase conflicts with upstream — `vaultTokens` stays byte-for-byte as upstream has it. **If this is ever upstreamed, unify the two schemas**: a single map keyed by token id, with the label optional and the append-versus-rotate behaviour selected by mode, is the design one would write from scratch. The comment at the definition in `server/src/config.ts` says the same thing, so the decision is not discoverable only from this document.
+
+Both maps use the same null-prototype discipline for the same reason — `__proto__` is a legal `vaultId` *and* a legal base64url `tokenId`, and on an ordinary object it is an inherited setter rather than a data property, so a write would report success while storing nothing. The map has no prototype, which removes the mechanism instead of blacklisting the name.
+
 ## Planned hardening (post-current)
 
-- Replace `tokenHash`-as-signing-key with a random per-server ticket signing secret generated at claim time and stored in the Config DO.  This removes the promotion of the token verifier hash to signing authority.  Existing deployments would backfill lazily on next claim.
+- Replace `tokenHash`-as-signing-key with a random per-server ticket signing secret generated at claim time and stored in the Config DO.  This removes the promotion of the token verifier hash to signing authority.  Existing deployments would backfill lazily on next claim.  **Implemented for `strict_permissions` mode** (see above), where it was not optional — that mode has no server-wide secret to derive a key from.  The generalisation to env and claim mode is still open, and the strict implementation is the reference: lazy get-or-create on the config DO at first ticket issuance, never rotated.
 - Ensure auth material is redacted from traces and diagnostics by default.
 
 For the broader list of accepted compromises and tracked debt, see

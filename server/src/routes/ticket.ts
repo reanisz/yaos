@@ -24,12 +24,23 @@
  * Derived from the existing auth secret so no new deployment secret is needed:
  *   env-token mode  → raw bytes of SYNC_TOKEN
  *   claim mode      → raw bytes of the stored tokenHash (hex string)
+ *   strict mode     → the dedicated ticketSigningSecret from the config DO
+ *
+ * Strict mode is the exception because it has no server-wide secret to derive
+ * from: its tokens are per-device, and signing with any one of them would make
+ * every ticket outlive only that device.  It therefore gets the random
+ * per-server secret that docs/architecture/zero-config-auth.md lists under
+ * "Planned hardening" — which also removes, for this mode, the promotion of a
+ * token VERIFIER hash to signing authority.  The other two modes keep their
+ * existing derivation untouched.
  *
  * The invariant is preserved: no Durable Object is woken before the ticket is
- * verified at the Worker edge (INV-SEC-01).
+ * verified at the Worker edge (INV-SEC-01).  Creating the strict secret is a DO
+ * write, and it happens on the issuance path only — never on verification.
  */
 
 import { base64UrlToBytes, bytesToBase64Url, randomBase64Url } from "../base64url";
+import { ensureTicketSigningSecret } from "./auth";
 import type { AuthState, Env } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -70,10 +81,16 @@ export interface TicketPayload {
 /**
  * Import the HMAC-SHA256 signing key from the server's auth secret.
  *
- * env mode  → SYNC_TOKEN (the raw token string)
- * claim mode → tokenHash  (the stored SHA-256 hex of the token)
+ * env mode    → SYNC_TOKEN (the raw token string)
+ * claim mode  → tokenHash  (the stored SHA-256 hex of the token)
+ * strict mode → ticketSigningSecret (32 random bytes, base64url)
  *
- * Returns null if the auth state is unclaimed (no key material available).
+ * Returns null when no key material is available: an unclaimed server, or a
+ * strict server whose secret has not been created yet.  On the ISSUANCE path
+ * that second case is resolved before we get here (see
+ * withStrictSigningSecret); on the VERIFICATION path it is the correct answer,
+ * because a server with no secret has never signed a ticket and any ticket
+ * presented to it is therefore forged or stale.
  */
 async function deriveSigningKey(authState: AuthState): Promise<CryptoKey | null> {
 	let keyMaterial: string;
@@ -81,6 +98,10 @@ async function deriveSigningKey(authState: AuthState): Promise<CryptoKey | null>
 		keyMaterial = authState.envToken;
 	} else if (authState.mode === "claim") {
 		keyMaterial = authState.tokenHash;
+	} else if (authState.mode === "strict") {
+		const secret = authState.config.ticketSigningSecret;
+		if (typeof secret !== "string" || secret.length === 0) return null;
+		keyMaterial = secret;
 	} else {
 		return null;
 	}
@@ -215,6 +236,29 @@ function isTicketPayload(value: unknown): value is TicketPayload {
 // ---------------------------------------------------------------------------
 
 /**
+ * Return an auth state whose strict signing secret is guaranteed to exist.
+ *
+ * On the first ticket a strict deployment ever issues there is no secret yet,
+ * so one is created through the config DO and spliced into the state this
+ * request signs with.  Every later call is a plain passthrough — the secret is
+ * already in the cached config — and every non-strict mode is untouched.
+ *
+ * The splice is a copy, not a mutation: `authState` may be the value another
+ * concurrent request is also holding.
+ */
+async function withStrictSigningSecret(authState: AuthState, env?: Env): Promise<AuthState> {
+	if (authState.mode !== "strict") return authState;
+	if (typeof authState.config.ticketSigningSecret === "string" && authState.config.ticketSigningSecret.length > 0) {
+		return authState;
+	}
+	if (!env) {
+		throw new Error("cannot sign ticket: strict mode needs the environment to create a signing secret");
+	}
+	const ticketSigningSecret = await ensureTicketSigningSecret(env);
+	return { ...authState, config: { ...authState.config, ticketSigningSecret } };
+}
+
+/**
  * POST /vault/:vaultId/auth/ticket
  *
  * Called by the plugin before opening a WebSocket connection.  The caller
@@ -234,7 +278,8 @@ export async function handleTicketRoute(
 			// Allow a short test TTL override so the integration harness can exercise
 			// the proactive refresh path without waiting 5 minutes.
 			const ttlMs = readTicketTtlMs(env?.YAOS_TICKET_TTL_MS);
-			const result = await createTicket(authState, vaultId, ttlMs);
+			const signingState = await withStrictSigningSecret(authState, env);
+			const result = await createTicket(signingState, vaultId, ttlMs);
 			return json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : "ticket creation failed";

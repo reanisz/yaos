@@ -652,6 +652,77 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 </html>`;
 }
 
+/**
+ * The home page of a server running in strict permissions mode.
+ *
+ * Rendered INSTEAD of the claim UI, whatever the server's claim state.  The
+ * claim flow is closed in strict mode (`POST /claim` answers 403 from the
+ * environment alone), so rendering the setup page would offer a button that
+ * cannot work — and rendering the running page would say "this server has been
+ * claimed and is locked", which is at best irrelevant and at worst reads as an
+ * invitation to look for the operator token.
+ *
+ * Carries no secret and no per-vault data: the host is the only per-request
+ * value, and it is already public.  There is deliberately no link to /admin —
+ * on a deployment where Access is configured the operator knows the URL, and
+ * advertising it to an anonymous visitor tells a scanner where to aim.
+ */
+export function renderStrictModePage(options: { host: string }): string {
+	const safeHost = options.host
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+
+	return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>YAOS Server — Strict Mode</title>
+  <style>
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, sans-serif;
+      background: #08111d; color: #f4f7fb;
+      min-height: 100vh; display: grid; place-items: center; padding: 24px;
+    }
+    .card {
+      width: min(540px, 100%); background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 32px;
+    }
+    .pulse-dot {
+      width: 12px; height: 12px; background: #88ffb8; border-radius: 50%;
+      display: inline-block; margin-right: 8px;
+      box-shadow: 0 0 12px rgba(136, 255, 184, 0.5);
+    }
+    h1 { margin: 0 0 12px; font-size: 24px; display: flex; align-items: center; }
+    p { margin: 0 0 16px; color: #a9c0d8; line-height: 1.6; font-size: 14px; }
+    p:last-child { margin-bottom: 0; }
+    code {
+      font-family: ui-monospace, monospace; font-size: 13px;
+      background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 6px; color: #7bdff6;
+    }
+    .host-badge {
+      display: inline-block; margin-bottom: 20px; padding: 6px 12px;
+      background: rgba(4, 10, 18, 0.6); border: 1px solid rgba(161, 205, 255, 0.1);
+      border-radius: 8px; font-family: ui-monospace, monospace; font-size: 12px;
+      color: #7bdff6; word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1><span class="pulse-dot"></span>YAOS Server is Online</h1>
+    <div class="host-badge">${safeHost}</div>
+    <p><strong>Strict permissions mode is active.</strong> This server has no server-wide token: there is nothing to claim from this page, and the claim endpoint is closed.</p>
+    <p>Access is granted one vault at a time, one device at a time. Each device gets its own token, which opens that vault and nothing else.</p>
+    <p>Tokens are issued from the administration page, which is protected by your Cloudflare Access policy. If you are the operator, sign in there to onboard a device.</p>
+  </main>
+</body>
+</html>`;
+}
+
 export function renderRunningPage(options: RunningPageOptions): string {
 	const authLabel =
 		options.authMode === "env"

@@ -119,6 +119,14 @@ export type SocketAuthResult =
  *   2. No ticket, legacy NOT disabled → verify long-lived token.
  *   3. No ticket, legacy IS disabled → reject unauthorised.  The server
  *      operator has opted out of the migration window.
+ *
+ * STRICT MODE needs no arm of its own here, and that is the design rather than
+ * an omission.  Both paths already ask the right question: verifyTicket derives
+ * the strict signing key from the config, and isAuthorizedForVault consults the
+ * strict token map and nothing else.  The two guards below cannot misfire
+ * either — a strict state carries `claimed: true` (see the AuthState comment in
+ * types.ts), and the "server_misconfigured" branch is reachable only from
+ * `mode === "env"`, which strict is not.
  */
 export async function authenticateSocketRequest(
 	ticket: string | null,

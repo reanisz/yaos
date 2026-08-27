@@ -1,7 +1,7 @@
 import { getAccessConfig } from "./accessJwt";
 import { ServerConfig, type StoredServerConfig } from "./config";
 import { VaultSyncServer } from "./server";
-import { renderMobileSetupPage, renderRunningPage, renderSetupPage } from "./setupPage";
+import { renderMobileSetupPage, renderRunningPage, renderSetupPage, renderStrictModePage } from "./setupPage";
 import { adminRouteBucket, handleAdminRoute, type AdminAction } from "./routes/admin";
 import {
 	canonicalRepoForSetup,
@@ -12,6 +12,7 @@ import {
 	handleClaimRoute,
 	handleUpdateMetadataRoute,
 	isAuthorized,
+	isStrictPermissionsEnabled,
 	rejectUnauthorizedVaultRequest,
 	supportsBuckets,
 } from "./routes/auth";
@@ -306,7 +307,7 @@ function logWorkerRequest(args: {
 	method: string;
 	status: number;
 	durationMs: number;
-	auth: "skipped" | "env" | "claim" | "unclaimed";
+	auth: "skipped" | "env" | "claim" | "strict" | "unclaimed";
 	isWebSocket: boolean;
 	cfRay: string | null;
 }): void {
@@ -377,7 +378,7 @@ async function rejectAndLogUnauthorizedVaultRequest(
  * is always present for claim/unclaimed modes — no ?? null needed.
  */
 function getConfigFromAuthState(authState: AuthStateCached): StoredServerConfig | null {
-	if (authState.mode === "claim" || authState.mode === "unclaimed") {
+	if (authState.mode === "claim" || authState.mode === "unclaimed" || authState.mode === "strict") {
 		return authState.config;
 	}
 	return null;
@@ -452,22 +453,46 @@ const worker = {
 			return response;
 		}
 
+		// Strict permissions closes the claim flow, and closes it from the
+		// ENVIRONMENT ALONE — before getAuthStateCached below, and therefore
+		// before any YAOS_CONFIG access.
+		//
+		// The ordering is the invariant, not an optimisation (issue #40).
+		// /claim is an unauthenticated POST: deciding it from a Durable Object
+		// read would let anyone on the internet make a strict deployment wake its
+		// config DO once per request, which is the amplification the route
+		// classifier above exists to prevent.  isStrictPermissionsEnabled reads
+		// one environment string and nothing else.  The regression is asserted
+		// against a trap env in tests/server/strict-permissions.ts.
+		//
+		// No withCors, matching the claim route's existing behaviour.
+		if (route.kind === "claim" && isStrictPermissionsEnabled(env)) {
+			const response = json({ error: "strict_permissions" }, 403);
+			logWorkerRequest({ route, method: req.method, status: 403, durationMs: Date.now() - start, auth: "skipped", isWebSocket, cfRay });
+			return response;
+		}
+
 		// Only recognised routes reach this point.
 		const authState = await getAuthStateCached(env);
 		let response: Response;
 
 		if (route.kind === "home") {
-			const body = authState.claimed
-				? renderRunningPage({
-					host: url.origin,
-					authMode: authState.mode,
-					attachments: supportsBuckets(env),
-					snapshots: supportsBuckets(env),
-				})
-				: renderSetupPage({
-					host: url.origin,
-					deployRepo: canonicalRepoForSetup(env),
-				});
+			// Strict mode never renders the claim UI, whatever the claim state:
+			// the flow it drives is closed (403 above), so the button could only
+			// fail.  See renderStrictModePage.
+			const body = authState.mode === "strict"
+				? renderStrictModePage({ host: url.origin })
+				: authState.claimed
+					? renderRunningPage({
+						host: url.origin,
+						authMode: authState.mode,
+						attachments: supportsBuckets(env),
+						snapshots: supportsBuckets(env),
+					})
+					: renderSetupPage({
+						host: url.origin,
+						deployRepo: canonicalRepoForSetup(env),
+					});
 			response = html(body);
 		} else if (route.kind === "mobile-setup") {
 			response = html(

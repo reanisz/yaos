@@ -262,6 +262,13 @@ s.section("Test 8: public capabilities do not expose private update metadata");
 		updateRepoUrl: "https://github.com/private/fork",
 		updateRepoBranch: "secret-branch",
 		vaultTokens: {},
+		// Strict-mode fields, present because StoredServerConfig requires them.
+		// This deployment is in claim mode, so both are at their empty values —
+		// and the secret being non-null would be the more interesting fixture
+		// only for a suite asserting it never escapes, which
+		// tests/server/strict-permissions.ts does.
+		strictTokens: {},
+		ticketSigningSecret: null,
 	};
 	const publicCaps = getCapabilities(auth, env, config);
 	s.check(publicCaps.maxBlobUploadBytes === MAX_BLOB_UPLOAD_BYTES, "capabilities expose the server blob upload cap");

@@ -1,3 +1,4 @@
+import { getAccessConfig } from "../accessJwt";
 import { sha256Hex } from "../hex";
 import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
 import type { StoredServerConfig } from "../config";
@@ -31,6 +32,73 @@ async function hashToken(token: string): Promise<string> {
 
 export function supportsBuckets(env: Env): boolean {
 	return env.YAOS_BUCKET !== undefined;
+}
+
+// ── Strict permissions mode ─────────────────────────────────────────────────
+//
+// One environment variable decides the whole mode, and it is read WITHOUT
+// touching a Durable Object.  That is what lets index.ts refuse POST /claim
+// from the environment alone, before any YAOS_CONFIG access (issue #40).
+
+const LOG_PREFIX = "[yaos-sync:worker]";
+
+/**
+ * True when YAOS_STRICT_PERMISSIONS is set to any non-empty value.
+ *
+ * Truthiness on the raw string, matching YAOS_DISABLE_LEGACY_WS_TOKEN: a
+ * whitespace-only value enables the mode rather than being trimmed away to
+ * "off".  For a hardening flag, an ambiguous value must fail closed.
+ */
+export function isStrictPermissionsEnabled(env: Env): boolean {
+	return typeof env.YAOS_STRICT_PERMISSIONS === "string" && env.YAOS_STRICT_PERMISSIONS.length > 0;
+}
+
+/**
+ * Both warnings are once per isolate, not once per request.
+ *
+ * Each describes a static deployment fact that cannot change without a new
+ * isolate, and the paths that reach them are exactly the ones a scanner
+ * hammers — the same reasoning getAccessConfig's warning uses.
+ */
+let warnedStrictEnvTokenIgnored = false;
+let warnedStrictAccessUnconfigured = false;
+
+/** Test-only: clear the once-per-isolate warning latches. */
+export function resetStrictWarningsForTests(): void {
+	warnedStrictEnvTokenIgnored = false;
+	warnedStrictAccessUnconfigured = false;
+}
+
+/**
+ * Warn about the two configurations that are legal but surprising.
+ *
+ * 1. SYNC_TOKEN alongside strict mode.  Strict wins and the environment token
+ *    authorizes nothing — fail closed, because the alternative (env mode wins)
+ *    would silently hand back the server-wide credential strict mode exists to
+ *    remove.  An operator who set both almost certainly believes the token
+ *    still works, so it is said out loud.
+ * 2. Strict mode without Cloudflare Access.  Everything still fails closed —
+ *    vault auth consults the strict tokens that already exist — but /admin is
+ *    the only surface that can issue a new one, so a deployment with no
+ *    tokens yet and no Access has locked itself out and needs to hear it.
+ */
+function warnOnStrictEnvironment(env: Env): void {
+	if (!warnedStrictEnvTokenIgnored && (env.SYNC_TOKEN?.trim() ?? "").length > 0) {
+		warnedStrictEnvTokenIgnored = true;
+		console.warn(
+			`${LOG_PREFIX} YAOS_STRICT_PERMISSIONS is set: SYNC_TOKEN is IGNORED and authorizes nothing. `
+			+ `Remove SYNC_TOKEN, or unset YAOS_STRICT_PERMISSIONS if you meant to use it.`,
+		);
+	}
+	if (!warnedStrictAccessUnconfigured && getAccessConfig(env) === null) {
+		warnedStrictAccessUnconfigured = true;
+		console.warn(
+			`${LOG_PREFIX} YAOS_STRICT_PERMISSIONS is set but Cloudflare Access is not configured. `
+			+ `/admin is the only surface that can issue a strict token, so no new device can be `
+			+ `onboarded until YAOS_ACCESS_TEAM_DOMAIN and YAOS_ACCESS_AUD are set. `
+			+ `Existing strict tokens keep working.`,
+		);
+	}
 }
 
 export function canonicalRepoForSetup(env: Env): string | undefined {
@@ -106,6 +174,42 @@ async function claimServerConfig(env: Env, tokenHash: string): Promise<boolean> 
 	return res.ok;
 }
 
+/**
+ * Get-or-create the strict-mode ticket signing secret, and make the new value
+ * visible to this isolate immediately.
+ *
+ * Called only from ticket ISSUANCE, and only on the one request per deployment
+ * that finds no secret yet: issuance is already an authenticated, comparatively
+ * rare operation (the plugin caches a ticket for its 5-minute TTL), so one
+ * extra Durable Object round-trip on it is a cost nothing else pays.  The
+ * alternative — creating the secret at boot, or on the auth path — would put a
+ * write in front of requests that do not need one.
+ *
+ * The config cache is invalidated afterwards so the next request in this
+ * isolate reads a config that carries the secret.  Other isolates converge
+ * within AUTH_CONFIG_CACHE_TTL_MS; until they do, a ticket signed here does not
+ * verify there.  That window exists exactly once in a deployment's life, on the
+ * very first ticket, and the plugin's ordinary reconnect resolves it.
+ */
+export async function ensureTicketSigningSecret(env: Env): Promise<string> {
+	const id = env.YAOS_CONFIG.idFromName("global-config");
+	const stub = env.YAOS_CONFIG.get(id);
+	const res = await stub.fetch("https://internal/__yaos/signing-secret", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: "{}",
+	});
+	if (!res.ok) {
+		throw new Error(`signing secret write failed (${res.status})`);
+	}
+	const payload: { ticketSigningSecret?: unknown } = await res.json();
+	if (typeof payload.ticketSigningSecret !== "string" || payload.ticketSigningSecret.length === 0) {
+		throw new Error("signing secret write failed (missing secret)");
+	}
+	invalidateStoredServerConfigCache();
+	return payload.ticketSigningSecret;
+}
+
 async function setServerUpdateMetadata(env: Env, metadata: {
 	updateProvider?: unknown;
 	updateRepoUrl?: unknown;
@@ -132,6 +236,14 @@ async function setServerUpdateMetadata(env: Env, metadata: {
 }
 
 export async function getAuthState(env: Env): Promise<AuthState> {
+	// Strict is decided first and unconditionally: it is the mode that removes
+	// credentials, so any ordering where another mode could win would mean an
+	// environment variable silently re-opening what strict closed.
+	if (isStrictPermissionsEnabled(env)) {
+		warnOnStrictEnvironment(env);
+		return { mode: "strict", claimed: true, config: await getStoredServerConfig(env) };
+	}
+
 	const envToken = env.SYNC_TOKEN?.trim();
 	if (envToken) {
 		return { mode: "env", claimed: true, envToken };
@@ -153,6 +265,14 @@ export async function getAuthState(env: Env): Promise<AuthState> {
  * reuse it without a second fetch (e.g. /api/capabilities).
  */
 export async function getAuthStateCached(env: Env): Promise<AuthStateCached> {
+	// Strict first — see getAuthState.  It reads the config through the same
+	// cached path as claim mode, because a strict server's credentials live in
+	// the config DO exactly as a claimed server's vault tokens do.
+	if (isStrictPermissionsEnabled(env)) {
+		warnOnStrictEnvironment(env);
+		return { mode: "strict", claimed: true, config: await getStoredServerConfigCached(env) };
+	}
+
 	const envToken = env.SYNC_TOKEN?.trim();
 	if (envToken) {
 		return { mode: "env", claimed: true, envToken };
@@ -166,6 +286,17 @@ export async function getAuthStateCached(env: Env): Promise<AuthStateCached> {
 	return { mode: "unclaimed", claimed: false, config };
 }
 
+/**
+ * Operator-level authorization: the server-wide credential.
+ *
+ * In STRICT mode this is always false, for every caller and every token.  That
+ * is the mode's central claim — there is no server-wide credential — and it is
+ * enforced here rather than at each call site so that a route added later
+ * cannot forget it.  The consequences follow from this one line: the operator
+ * API, /api/update-metadata and the private update metadata in
+ * /api/capabilities all gate on isAuthorized, so all three are closed in strict
+ * mode without any of them knowing the mode exists.
+ */
 export async function isAuthorized(
 	state: AuthState,
 	token: string | null,
@@ -193,12 +324,31 @@ export async function isAuthorized(
  * vault-token map lives in the config DO, so honouring it here would put a
  * YAOS_CONFIG round-trip back on every request.  See
  * docs/architecture/zero-config-auth.md.
+ *
+ * STRICT mode has no "or the operator token" arm at all: a request opens a
+ * vault if and only if it carries one of that vault's own device tokens.
  */
 export async function isAuthorizedForVault(
 	state: AuthState,
 	token: string | null,
 	vaultId: string,
 ): Promise<boolean> {
+	// Checked before the operator arm below, not after: in strict mode
+	// isAuthorized is always false, so falling through would be correct but
+	// would read as though the operator token were still a candidate here.
+	if (state.mode === "strict") {
+		if (!token) return false;
+		const hash = await hashToken(token);
+		// A flat scan of a map capped at MAX_STRICT_TOKENS.  A vaultId-keyed
+		// index would be faster and would also be a second source of truth for
+		// which token belongs to which vault; at this bound the scan is the
+		// cheaper thing to keep correct.
+		for (const record of Object.values(state.config.strictTokens ?? {})) {
+			if (record.vaultId === vaultId && record.tokenHash === hash) return true;
+		}
+		return false;
+	}
+
 	if (await isAuthorized(state, token)) return true;
 	if (!token || state.mode !== "claim") return false;
 
@@ -266,6 +416,7 @@ export function getCapabilities(
 ): {
 	claimed: boolean;
 	authMode: "env" | "claim" | "unclaimed";
+	strictPermissions: boolean;
 	attachments: boolean;
 	snapshots: boolean;
 	maxBlobUploadBytes: number;
@@ -281,7 +432,35 @@ export function getCapabilities(
 	const bucketEnabled = supportsBuckets(env);
 	return {
 		claimed: auth.claimed,
-		authMode: auth.mode,
+		// COMPATIBILITY SHIM — strict mode reports authMode "claim", not "strict".
+		//
+		// The plugin's own validator hard-enumerates this field
+		// (isServerCapabilities in src/runtime/capabilityUpdateService.ts:
+		// `authMode === "env" || "claim" || "unclaimed"`), and a value outside
+		// that set makes the WHOLE capabilities payload invalid — the plugin
+		// then treats the server as unreachable rather than as one it does not
+		// fully understand.  Unknown EXTRA fields, by contrast, pass that
+		// validator untouched.
+		//
+		// So the mode is published as the additive `strictPermissions` flag
+		// below, and authMode carries the nearest true statement about how a
+		// client authenticates: a bearer token verified against a hash in the
+		// config Durable Object, which is exactly claim mode's contract and
+		// exactly what a strict device token does.  The field a client acts on
+		// is therefore never a lie; the field it cannot parse is never sent.
+		//
+		// If the plugin's validator is ever widened to accept "strict", this
+		// shim can be dropped — but only after the minimum supported plugin
+		// version includes that change.
+		authMode: auth.mode === "strict" ? "claim" : auth.mode,
+		/**
+		 * Additive and always present: false in every non-strict mode, which is
+		 * harmless to a client that ignores it and unambiguous to one that does
+		 * not.  Public on purpose — a client cannot discover that the global
+		 * token is dead any other way, and the fact leaks nothing: it describes
+		 * a policy, not a credential.
+		 */
+		strictPermissions: auth.mode === "strict",
 		attachments: bucketEnabled,
 		snapshots: bucketEnabled,
 		maxBlobUploadBytes: MAX_BLOB_UPLOAD_BYTES,
@@ -298,6 +477,14 @@ export function getCapabilities(
 
 export async function handleClaimRoute(req: Request, env: Env, authState: AuthState): Promise<Response> {
 	const url = new URL(req.url);
+	// Strict mode closes the claim route entirely: there is no server-wide token
+	// for it to mint.  index.ts refuses this route from the environment alone,
+	// before getAuthStateCached and therefore before any Durable Object access
+	// (issue #40) — this arm is the second lock, so that a future caller of
+	// handleClaimRoute cannot reopen the flow by skipping the classifier.
+	if (isStrictPermissionsEnabled(env)) {
+		return json({ error: "strict_permissions" }, 403);
+	}
 	if (authState.claimed) {
 		return json({ error: "already_claimed" }, 403);
 	}

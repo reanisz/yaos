@@ -44,6 +44,7 @@ import { randomBase64Url } from "../base64url";
 import {
 	normalizeVaultId,
 	normalizeVaultTokenLabel,
+	STRICT_TOKEN_ID_BYTES,
 	type StoredServerConfig,
 } from "../config";
 import { sha256Hex } from "../hex";
@@ -52,6 +53,7 @@ import {
 	getHttpAuthToken,
 	invalidateStoredServerConfigCache,
 	isAuthorized,
+	isStrictPermissionsEnabled,
 } from "./auth";
 import { json } from "./http";
 import type { AuthStateCached, Env } from "./types";
@@ -192,6 +194,121 @@ export async function issueVaultToken(
 	};
 }
 
+// ── Strict-mode device tokens ───────────────────────────────────────────────
+//
+// The same three operations against the separate strictTokens store (see the
+// StrictTokenRecord comment in config.ts for why it is separate).  Three
+// differences, all of them the point of the mode:
+//
+//   - issuing APPENDS rather than rotates, so one vault holds one token per
+//     device and onboarding a second device never logs the first one out;
+//   - `label` is required, because it is the only handle for deciding which of
+//     a vault's tokens to revoke;
+//   - revocation is by tokenId, for the same reason.
+
+/** Public view of one strict token.  Deliberately never carries tokenHash. */
+export interface StrictTokenSummary {
+	tokenId: string;
+	vaultId: string;
+	label: string;
+	createdAt: number;
+}
+
+/** Everything a freshly issued strict token consists of.  `token` only here. */
+export interface IssuedStrictToken {
+	tokenId: string;
+	vaultId: string;
+	token: string;
+	label: string;
+	createdAt: number;
+	obsidianUrl: string;
+}
+
+export type IssueStrictTokenResult =
+	| { ok: true; issued: IssuedStrictToken }
+	| { ok: false; failure: VaultTokenFailure };
+
+/**
+ * Summarise the strict store for the operator.
+ *
+ * Flat rather than grouped by vault: the admin page groups it for display, and
+ * a flat list keeps this response the same shape as the claim-mode listing, so
+ * both front doors and both modes read one array of records.  Sorted by vault
+ * first so a page that groups gets its groups contiguous for free, then by
+ * issue time within a vault.
+ *
+ * The projection is explicit, never a spread: tokenHash must not appear.
+ */
+export function listStrictTokens(config: StoredServerConfig): StrictTokenSummary[] {
+	const tokens = config.strictTokens ?? {};
+	return Object.entries(tokens)
+		.map(([tokenId, record]) => ({
+			tokenId,
+			vaultId: record.vaultId,
+			label: record.label,
+			createdAt: record.createdAt,
+		}))
+		.sort((a, b) =>
+			a.vaultId.localeCompare(b.vaultId)
+			|| a.createdAt - b.createdAt
+			|| a.tokenId.localeCompare(b.tokenId));
+}
+
+/**
+ * Mint a new device token for `vaultId`.  Never replaces an existing one.
+ *
+ * As with issueVaultToken, the plaintext exists only in the return value and
+ * the caller MUST treat a successful result as its single delivery.
+ */
+export async function issueStrictToken(
+	env: Env,
+	origin: string,
+	vaultId: string,
+	label: string,
+): Promise<IssueStrictTokenResult> {
+	const token = randomBase64Url(VAULT_TOKEN_BYTES);
+	const tokenHash = await sha256Hex(new TextEncoder().encode(token));
+	// The tokenId is a revocation handle, not a credential — it is listed to
+	// the operator in the clear — so it is deliberately shorter than the token.
+	const tokenId = randomBase64Url(STRICT_TOKEN_ID_BYTES);
+	const createdAt = Date.now();
+
+	const res = await callConfigDurableObject(env, "/__yaos/strict-tokens", {
+		tokenId,
+		vaultId,
+		tokenHash,
+		label,
+		createdAt,
+	});
+	if (!res.ok) {
+		return { ok: false, failure: await forwardConfigFailure(res, "strict token write failed") };
+	}
+	invalidateStoredServerConfigCache();
+
+	return {
+		ok: true,
+		issued: {
+			tokenId,
+			vaultId,
+			token,
+			label,
+			createdAt,
+			obsidianUrl: buildObsidianSetupUrl(origin, token, vaultId),
+		},
+	};
+}
+
+/** Delete one device token by id.  `existed` is false when there was none. */
+export async function revokeStrictToken(env: Env, tokenId: string): Promise<RevokeVaultTokenResult> {
+	const res = await callConfigDurableObject(env, "/__yaos/strict-tokens/revoke", { tokenId });
+	if (!res.ok) {
+		return { ok: false, failure: await forwardConfigFailure(res, "strict token revoke failed") };
+	}
+	const payload: { existed?: unknown } = await res.json();
+	invalidateStoredServerConfigCache();
+	return { ok: true, existed: payload.existed === true };
+}
+
 /** Delete `vaultId`'s token.  `existed` is false when it had none. */
 export async function revokeVaultToken(env: Env, vaultId: string): Promise<RevokeVaultTokenResult> {
 	const res = await callConfigDurableObject(env, "/__yaos/vault-tokens/revoke", { vaultId });
@@ -225,6 +342,25 @@ export async function handleVaultTokensRoute(
 	authState: AuthStateCached,
 	action: VaultTokensAction,
 ): Promise<Response> {
+	// STRICT MODE closes this whole surface: it is the bearer-token operator
+	// API, and strict mode has no operator token.  Management moves to /admin,
+	// which authenticates with Cloudflare Access instead.
+	//
+	// WHY THIS IS BEFORE THE AUTH GATE, when the 409 below is deliberately
+	// after it.  The rule that ordering serves is "a rejection must not tell an
+	// unauthenticated caller anything /api/capabilities does not already
+	// publish".  For the env-mode 409 that means sitting behind the 401,
+	// because nothing publishes it.  Strict mode is the opposite case: the
+	// capabilities payload carries `strictPermissions: true` to every
+	// unauthenticated GET, by design — a client has no other way to learn that
+	// its global token is dead.  A 403 here therefore discloses nothing new,
+	// and putting it behind the operator gate would be worse than pointless: in
+	// strict mode isAuthorized is always false, so the 403 would be
+	// unreachable and every caller — including the operator holding what used
+	// to be the right credential — would get a bare 401 that names no reason.
+	if (isStrictPermissionsEnabled(env)) {
+		return json({ error: "strict_permissions" }, 403);
+	}
 	if (!authState.claimed) {
 		return json({ error: "unclaimed" }, 503);
 	}

@@ -9,22 +9,26 @@
  * # Nothing secret is rendered
  * The shell contains exactly two pieces of per-request data — the server's own
  * origin and its auth mode — and neither is a secret (GET /api/capabilities
- * already publishes the mode).  Tokens reach this page only as the JSON body
- * of an issue call the operator just made, which is why the "shown once" panel
- * is built by script and never by the renderer.
+ * already publishes both, including `strictPermissions`).  Tokens reach this
+ * page only as the JSON body of an issue call the operator just made, which is
+ * why the "shown once" panel is built by script and never by the renderer.  In
+ * strict mode that also means the ticket signing secret cannot appear here:
+ * the renderer is given a host and a mode, not a config.
  *
  * # Escaping
- * `host` is interpolated through escapeHtml.  Everything else — vault IDs and
+ * `host` is interpolated through escapeHtml.  The header copy is interpolated
+ * raw and may be, because it is a compile-time constant chosen by the mode —
+ * no request byte reaches it.  Everything else — vault IDs, device names and
  * labels, which are operator-controlled but still arbitrary text — is written
- * into the DOM with textContent, never innerHTML.  The rule is deliberately
- * "no data ever reaches innerHTML" rather than "escape data before innerHTML":
- * the first is checkable by reading the file, the second is checkable only by
- * proving a negative about every future edit.
+ * into the DOM with textContent, never innerHTML, group headings included.
+ * The rule is deliberately "no data ever reaches innerHTML" rather than
+ * "escape data before innerHTML": the first is checkable by reading the file,
+ * the second is checkable only by proving a negative about every future edit.
  */
 
 interface AdminPageOptions {
 	host: string;
-	authMode: "env" | "claim" | "unclaimed";
+	authMode: "env" | "claim" | "unclaimed" | "strict";
 }
 
 function escapeHtml(value: string): string {
@@ -166,6 +170,30 @@ const ADMIN_PAGE_STYLE = `
     .qr { margin-top: 16px; background: #fff; padding: 8px; border-radius: 12px; display: none; width: 152px; }
     .qr.show { display: block; }
     .qr img { display: block; width: 136px; height: 136px; }
+    .banner {
+      margin-bottom: 18px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: rgba(123, 223, 246, 0.07);
+      border: 1px solid rgba(123, 223, 246, 0.28);
+      color: #cfeffa;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .banner strong { color: #7bdff6; }
+    .vault-group { margin-top: 22px; }
+    .vault-group:first-of-type { margin-top: 8px; }
+    .vault-group > h3 {
+      margin: 0 0 2px;
+      font-family: ui-monospace, monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: #7bdff6;
+      word-break: break-all;
+    }
+    .vault-group > .count { color: #6984a3; font-size: 12px; }
+    .vault-group table { margin-top: 8px; }
+    td.device { font-weight: 600; }
     @media (max-width: 620px) {
       body { padding: 20px 14px; }
       .card { padding: 18px; }
@@ -219,6 +247,281 @@ const ADMIN_APP_MARKUP = `
         <tbody id="token-rows"></tbody>
       </table>
     </section>`;
+
+/**
+ * The strict-mode management UI.
+ *
+ * Two differences from the claim-mode markup above, both of them the mode:
+ * the device name is REQUIRED (it is the only handle for deciding which of a
+ * vault's tokens to revoke), and issuing ADDS a token rather than replacing
+ * one, so the copy says so and there is no rotation warning to give.
+ */
+const ADMIN_STRICT_MARKUP = `
+    <div class="banner">
+      <strong>Strict permissions mode is active.</strong>
+      There is no server-wide token on this deployment: the claim flow is closed and
+      <code>SYNC_TOKEN</code> is ignored. A vault is opened only by one of its own device
+      tokens, issued here. This page works whether or not the server was ever claimed.
+    </div>
+
+    <section class="card">
+      <h2>Issue a device token</h2>
+      <p>Each token opens exactly one vault, from one device. Issuing another for the same vault adds it — nothing already in use stops working. Give every device its own token: sharing one across devices means revoking it logs all of them out.</p>
+      <form id="issue-form" style="margin-top:18px">
+        <div class="field-row">
+          <div>
+            <label for="vault-id">Vault ID</label>
+            <input id="vault-id" type="text" autocomplete="off" spellcheck="false" required minlength="8" maxlength="256" placeholder="the vault's ID from the plugin settings" />
+          </div>
+          <div>
+            <label for="token-label">Device name (required)</label>
+            <input id="token-label" type="text" autocomplete="off" required maxlength="64" placeholder="work laptop" />
+          </div>
+        </div>
+        <button id="issue-button" type="submit">Issue token</button>
+      </form>
+      <div id="issue-error" class="error" aria-live="polite"></div>
+
+      <div id="token-panel" class="token-panel">
+        <div class="notice">This token is shown once. Copy it now — the server keeps only its hash and cannot show it again. Issue a new one if you lose it.</div>
+        <div style="margin-top:14px">
+          <label for="token-output">New token for <span id="token-vault"></span></label>
+          <code id="token-output" class="token-value"></code>
+        </div>
+        <div class="token-actions">
+          <button id="copy-token" class="ghost" type="button">Copy token</button>
+          <a id="obsidian-link" href="#">Open in Obsidian</a>
+          <span id="qr-note" class="muted"></span>
+        </div>
+        <div id="qr" class="qr" aria-label="YAOS mobile setup QR"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Device tokens by vault</h2>
+      <p>Revoking one device leaves every other device on that vault connected. A revoked token stops working once the config cache turns over (up to 60 seconds).</p>
+      <div id="list-error" class="error" aria-live="polite"></div>
+      <div id="list-empty" class="muted" style="margin-top:14px">Loading…</div>
+      <div id="vault-groups"></div>
+    </section>`;
+
+/**
+ * Client script for the strict-mode UI.
+ *
+ * Same discipline as the claim-mode script below: string concatenation rather
+ * than template literals (this whole value is itself inside one), and no data
+ * ever reaches innerHTML — every vault ID and device name is written with
+ * textContent, including the group headings, which are built element by element
+ * for exactly that reason.
+ */
+const ADMIN_STRICT_SCRIPT = `
+    const issueForm = document.getElementById("issue-form");
+    const issueButton = document.getElementById("issue-button");
+    const vaultInput = document.getElementById("vault-id");
+    const labelInput = document.getElementById("token-label");
+    const issueError = document.getElementById("issue-error");
+    const tokenPanel = document.getElementById("token-panel");
+    const tokenOutput = document.getElementById("token-output");
+    const tokenVault = document.getElementById("token-vault");
+    const copyButton = document.getElementById("copy-token");
+    const obsidianLink = document.getElementById("obsidian-link");
+    const qrEl = document.getElementById("qr");
+    const qrNote = document.getElementById("qr-note");
+    const listError = document.getElementById("list-error");
+    const listEmpty = document.getElementById("list-empty");
+    const groups = document.getElementById("vault-groups");
+
+    async function callApi(path, body) {
+      const init = body === undefined
+        ? { method: "GET", headers: { "Accept": "application/json" } }
+        : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+      const res = await fetch(path, init);
+      let data = null;
+      try { data = await res.json(); } catch (err) { data = null; }
+      if (!res.ok) {
+        const reason = data && typeof data.error === "string" ? data.error : "request failed (" + res.status + ")";
+        throw new Error(reason);
+      }
+      return data;
+    }
+
+    function formatDate(value) {
+      if (typeof value !== "number" || !isFinite(value)) return "unknown";
+      const date = new Date(value);
+      return isNaN(date.getTime()) ? "unknown" : date.toLocaleString();
+    }
+
+    function cell(text, className) {
+      const td = document.createElement("td");
+      if (className) td.className = className;
+      td.textContent = text;
+      return td;
+    }
+
+    function renderRow(entry) {
+      const tr = document.createElement("tr");
+      tr.appendChild(cell(String(entry.label), "device"));
+      tr.appendChild(cell(formatDate(entry.createdAt)));
+
+      const actions = document.createElement("td");
+      actions.className = "actions";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost danger";
+      button.textContent = "Revoke";
+      button.addEventListener("click", async () => {
+        if (button.dataset.confirming !== "yes") {
+          button.dataset.confirming = "yes";
+          button.textContent = "Confirm revoke";
+          setTimeout(() => {
+            if (button.dataset.confirming !== "yes") return;
+            button.dataset.confirming = "no";
+            button.textContent = "Revoke";
+          }, 5000);
+          return;
+        }
+        button.disabled = true;
+        button.textContent = "Revoking…";
+        try {
+          await callApi("/admin/api/vault-tokens/revoke", { tokenId: entry.tokenId });
+          await loadTokens();
+        } catch (err) {
+          listError.textContent = err.message;
+          button.disabled = false;
+          button.dataset.confirming = "no";
+          button.textContent = "Revoke";
+        }
+      });
+      actions.appendChild(button);
+      tr.appendChild(actions);
+      return tr;
+    }
+
+    /** One section per vault. The heading is textContent — never innerHTML. */
+    function renderGroup(vaultId, entries) {
+      const section = document.createElement("div");
+      section.className = "vault-group";
+
+      const heading = document.createElement("h3");
+      heading.textContent = vaultId;
+      section.appendChild(heading);
+
+      const count = document.createElement("div");
+      count.className = "count";
+      count.textContent = entries.length === 1 ? "1 device" : entries.length + " devices";
+      section.appendChild(count);
+
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      for (const title of ["Device", "Issued", ""]) {
+        const th = document.createElement("th");
+        th.textContent = title;
+        headRow.appendChild(th);
+      }
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      for (const entry of entries) tbody.appendChild(renderRow(entry));
+      table.appendChild(tbody);
+      section.appendChild(table);
+      return section;
+    }
+
+    async function loadTokens() {
+      listError.textContent = "";
+      try {
+        const data = await callApi("/admin/api/vault-tokens");
+        const entries = Array.isArray(data && data.vaultTokens) ? data.vaultTokens : [];
+        // The server sorts by vaultId, so a Map preserves grouping order.
+        const byVault = new Map();
+        for (const entry of entries) {
+          const vaultId = String(entry.vaultId);
+          if (!byVault.has(vaultId)) byVault.set(vaultId, []);
+          byVault.get(vaultId).push(entry);
+        }
+        groups.replaceChildren();
+        for (const [vaultId, vaultEntries] of byVault) {
+          groups.appendChild(renderGroup(vaultId, vaultEntries));
+        }
+        listEmpty.style.display = entries.length > 0 ? "none" : "block";
+        listEmpty.textContent = "No device tokens yet. Issue one above to onboard a device.";
+      } catch (err) {
+        groups.replaceChildren();
+        listEmpty.style.display = "none";
+        listError.textContent = err.message;
+      }
+    }
+
+    function showIssued(data) {
+      tokenVault.textContent = String(data.vaultId) + " · " + String(data.label);
+      tokenOutput.textContent = String(data.token);
+
+      const link = typeof data.obsidianUrl === "string" ? data.obsidianUrl : "";
+      if (link.indexOf("obsidian://") === 0) {
+        obsidianLink.href = link;
+        obsidianLink.style.display = "inline-flex";
+      } else {
+        obsidianLink.removeAttribute("href");
+        obsidianLink.style.display = "none";
+      }
+
+      qrEl.replaceChildren();
+      const qr = typeof data.mobileSetupQrDataUrl === "string" ? data.mobileSetupQrDataUrl : "";
+      if (qr.indexOf("data:image/svg+xml;base64,") === 0) {
+        const image = document.createElement("img");
+        image.src = qr;
+        image.alt = "YAOS mobile setup QR";
+        qrEl.appendChild(image);
+        qrEl.classList.add("show");
+        qrNote.textContent = "Scan on a phone to finish mobile setup.";
+      } else {
+        qrEl.classList.remove("show");
+        qrNote.textContent = "QR rendering unavailable — use the link or copy the token.";
+      }
+      tokenPanel.classList.add("show");
+    }
+
+    copyButton.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(tokenOutput.textContent || "");
+        copyButton.textContent = "Copied!";
+        setTimeout(() => { copyButton.textContent = "Copy token"; }, 2000);
+      } catch (err) {
+        copyButton.textContent = "Copy failed — select it manually";
+      }
+    });
+
+    issueForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      issueError.textContent = "";
+      const vaultId = vaultInput.value.trim();
+      const label = labelInput.value.trim();
+      if (vaultId.length < 8) {
+        issueError.textContent = "A vault ID is at least 8 characters.";
+        return;
+      }
+      if (label.length === 0) {
+        issueError.textContent = "A device name is required — it is how you tell this token from the vault's others.";
+        return;
+      }
+      issueButton.disabled = true;
+      issueButton.textContent = "Issuing…";
+      try {
+        const data = await callApi("/admin/api/vault-tokens", { vaultId: vaultId, label: label });
+        showIssued(data);
+        labelInput.value = "";
+        await loadTokens();
+      } catch (err) {
+        issueError.textContent = err.message;
+      } finally {
+        issueButton.disabled = false;
+        issueButton.textContent = "Issue token";
+      }
+    });
+
+    loadTokens();`;
 
 /**
  * Client script for the claim-mode UI.
@@ -424,15 +727,42 @@ function renderUnavailableState(authMode: "env" | "unclaimed"): string {
     </section>`;
 }
 
+/** Header copy.  Strict mode manages devices; claim mode manages vaults. */
+function renderHeaderCopy(authMode: AdminPageOptions["authMode"]): { title: string; blurb: string } {
+	if (authMode === "strict") {
+		return {
+			title: "Device access tokens",
+			blurb: "Issue and revoke the per-device tokens for this sync server. "
+				+ "This page is reachable only through your Cloudflare Access policy, "
+				+ "and it is the only way to issue a credential on this deployment.",
+		};
+	}
+	return {
+		title: "Vault access tokens",
+		blurb: "Issue, rotate and revoke the per-vault tokens for this sync server. "
+			+ "This page is reachable only through your Cloudflare Access policy.",
+	};
+}
+
 export function renderAdminPage(options: AdminPageOptions): string {
 	const safeHost = escapeHtml(options.host);
-	// The script is emitted only in claim mode: in the other two states there is
-	// no UI for it to drive, and shipping it would have the page fire an API
-	// call it already knows will be refused.
-	const body = options.authMode === "claim"
-		? ADMIN_APP_MARKUP
-		: renderUnavailableState(options.authMode);
-	const script = options.authMode === "claim" ? `\n  <script>${ADMIN_APP_SCRIPT}\n  </script>` : "";
+	// A script is emitted only for the two modes that have a UI for it to drive.
+	// In env mode and on an unclaimed non-strict server there is none, and
+	// shipping one would have the page fire an API call it already knows will be
+	// refused.  Strict mode is deliberately NOT gated on the claim state: /admin
+	// is the only surface that can issue a strict token, so a never-claimed
+	// strict server must render the full form.
+	const body = options.authMode === "strict"
+		? ADMIN_STRICT_MARKUP
+		: options.authMode === "claim"
+			? ADMIN_APP_MARKUP
+			: renderUnavailableState(options.authMode);
+	const script = options.authMode === "strict"
+		? `\n  <script>${ADMIN_STRICT_SCRIPT}\n  </script>`
+		: options.authMode === "claim"
+			? `\n  <script>${ADMIN_APP_SCRIPT}\n  </script>`
+			: "";
+	const { title, blurb } = renderHeaderCopy(options.authMode);
 
 	return `<!DOCTYPE html>
 <html lang="en">
@@ -448,8 +778,8 @@ export function renderAdminPage(options: AdminPageOptions): string {
   <main>
     <header>
       <div class="eyebrow">Cloudflare Access</div>
-      <h1>Vault access tokens</h1>
-      <p>Issue, rotate and revoke the per-vault tokens for this sync server. This page is reachable only through your Cloudflare Access policy.</p>
+      <h1>${title}</h1>
+      <p>${blurb}</p>
       <div class="host-badge">${safeHost}</div>
     </header>
 ${body}

@@ -60,6 +60,45 @@ enabled = true
 # YAOS_ENABLE_ADMIN_ROUTES = "true"
 
 # ---------------------------------------------------------------------------
+# Strict permissions mode (no server-wide token)
+# ---------------------------------------------------------------------------
+#
+# Set YAOS_STRICT_PERMISSIONS to any non-empty string to remove the
+# server-wide credential entirely:
+#
+#   - the claimed token and SYNC_TOKEN authorize NOTHING — not vault routes,
+#     not sockets, not the operator API;
+#   - POST /claim answers 403 (decided from this variable alone, before any
+#     Durable Object is touched);
+#   - a vault is opened only by one of its own per-DEVICE tokens, issued from
+#     the /admin page below;
+#   - issuing ADDS a token rather than replacing one, so onboarding a second
+#     device never disconnects the first.
+#
+# Unset — the default — the server behaves exactly as it always has.
+#
+# CONFIGURE CLOUDFLARE ACCESS FIRST.  /admin is the only surface that can issue
+# a credential in this mode, and it exists only where the two Access variables
+# below are set.  Turning strict mode on without them leaves a server whose
+# existing tokens keep working but which cannot onboard a new device; the
+# Worker logs one warning per isolate saying so.
+#
+# SYNC_TOKEN set alongside this is IGNORED (fail closed), with one warning per
+# isolate.  Remove it rather than relying on that.
+#
+# Prefer a Worker SECRET over the [vars] block below, for the same reason the
+# Access variables do: dashboard-set plaintext variables are removed by the
+# next wrangler-driven deploy, and a deployment that silently falls out of
+# strict mode is the failure this variable exists to prevent.  Add it as
+# dashboard → Settings → Variables and Secrets → type "Secret", or
+# `wrangler secret put YAOS_STRICT_PERMISSIONS`.
+#
+# See docs/architecture/zero-config-auth.md, "strict_permissions mode".
+#
+# [vars]
+# YAOS_STRICT_PERMISSIONS = "1"
+
+# ---------------------------------------------------------------------------
 # Cloudflare Access-gated /admin page (per-vault token management)
 # ---------------------------------------------------------------------------
 #

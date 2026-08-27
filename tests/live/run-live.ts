@@ -44,11 +44,17 @@ interface WranglerInstance {
 /**
  * Boot `wrangler dev` on 127.0.0.1:8787 with a fresh persist directory.
  *
- * `syncToken` is the whole difference between the two phases:
+ * `syncToken` is the difference between the first two phases:
  *   - a string puts SYNC_TOKEN in the child environment, so the server comes up
  *     in env mode (claimed, authMode "env") exactly as it always has;
  *   - `null` guarantees the variable is ABSENT, so the server comes up
  *     unclaimed and the claim flow is reachable.
+ *
+ * Phase 3 uses `null` as well, and adds YAOS_STRICT_PERMISSIONS through
+ * `extraArgs`. The deletion matters even more there: strict mode is fail-closed
+ * against a SYNC_TOKEN it finds, so an inherited one would not change the
+ * server's behaviour but WOULD emit a warning the suite does not expect, and it
+ * would make the "no token leaked" assertion meaningless.
  */
 function startWrangler(options: {
 	readonly syncToken: string | null;
@@ -279,7 +285,7 @@ function dumpWranglerOutput(wrangler: WranglerInstance, phase: string): void {
  * observe an expiry in seconds, and the eight suites in their original order.
  */
 async function runEnvModePhase(): Promise<void> {
-	console.log("\n=== live phase 1/2: env mode (SYNC_TOKEN) ===");
+	console.log("\n=== live phase 1/3: env mode (SYNC_TOKEN) ===");
 	const envToken = randomBytes(32).toString("hex");
 	const wrangler = startWrangler({
 		syncToken: envToken,
@@ -348,7 +354,7 @@ async function runEnvModePhase(): Promise<void> {
  * suite and would be an outright trap carrying a vault-scoped one.
  */
 async function runClaimModePhase(): Promise<void> {
-	console.log("\n=== live phase 2/2: claim mode (unclaimed server, per-vault tokens) ===");
+	console.log("\n=== live phase 2/3: claim mode (unclaimed server, per-vault tokens) ===");
 	const wrangler = startWrangler({ syncToken: null });
 
 	const suiteEnv: NodeJS.ProcessEnv = { ...process.env, YAOS_TEST_HOST: HOST };
@@ -371,19 +377,85 @@ async function runClaimModePhase(): Promise<void> {
 	}
 }
 
+/**
+ * Phase 3 — strict permissions mode.
+ *
+ * A third `wrangler dev`, booted with YAOS_STRICT_PERMISSIONS and no
+ * SYNC_TOKEN (the same env deletion phase 2 relies on), plus STUB Cloudflare
+ * Access variables.
+ *
+ * WHY THE ACCESS VARIABLES ARE HERE AT ALL, given that no request in this phase
+ * can produce a valid Access token: without them, every /admin path answers the
+ * ordinary 404 and the phase could not tell "the admin surface refused me" from
+ * "the admin surface does not exist on this build". With them, /admin answers
+ * 401 and that distinction becomes observable. The values are syntactically
+ * valid and functionally inert — a team domain nobody owns, and 64 hex zeros
+ * for the AUD — so the Worker builds an AccessConfig and then refuses every
+ * token, which is precisely the surface this phase measures. Note that the JWKS
+ * URL is never fetched: a request with no header is refused before verification
+ * even starts, so this phase makes no outbound network call.
+ *
+ * WHY THERE IS NO POSITIVE ISSUANCE PATH: see the long header comment in
+ * tests/live/strict-permissions-live.ts. Short version: verifying an Access JWT
+ * requires the team's real JWKS, the Worker fetches it itself, and there is no
+ * injection seam across an HTTP boundary — so issuance is proven in-process by
+ * tests/server/strict-permissions.ts against the REAL verifier and a real RSA
+ * keypair, and this phase proves the refusals that only a real deployment can.
+ *
+ * The suite is handed NO credential, deliberately. In strict mode there is no
+ * credential that would help, and threading one in through SYNC_TOKEN — which
+ * means "the global operator token" to every phase-1 suite — would be an
+ * outright trap here, where the global token is exactly what must not work.
+ */
+async function runStrictModePhase(): Promise<void> {
+	console.log("\n=== live phase 3/3: strict permissions (no global token, claim closed) ===");
+	const wrangler = startWrangler({
+		syncToken: null,
+		extraArgs: [
+			"--var",
+			"YAOS_STRICT_PERMISSIONS:1",
+			// Inert but well-formed, so /admin exists to be refused.
+			"--var",
+			"YAOS_ACCESS_TEAM_DOMAIN:yaos-live-strict.cloudflareaccess.com",
+			"--var",
+			`YAOS_ACCESS_AUD:${"0".repeat(64)}`,
+		],
+	});
+
+	const suiteEnv: NodeJS.ProcessEnv = { ...process.env, YAOS_TEST_HOST: HOST };
+	// Same reasoning as phase 2: the suite asserts that no server-wide token
+	// works, and must not be handed one that could paper over a leak.
+	delete suiteEnv.SYNC_TOKEN;
+
+	try {
+		await waitForWorker(wrangler);
+		await spawnSuite("node", [
+			...NODE_TS,
+			"tests/live/strict-permissions-live.ts",
+		], suiteEnv);
+	} catch (err) {
+		dumpWranglerOutput(wrangler, "phase 3, strict permissions");
+		throw err;
+	} finally {
+		await wrangler.shutdown();
+	}
+}
+
 async function main() {
-	// Sequential, and fail-fast. The two phases share port 8787, so phase 2
-	// cannot start until phase 1's wrangler has fully exited — that is what the
-	// awaited shutdown() inside runEnvModePhase's `finally` guarantees. Fail-fast
+	// Sequential, and fail-fast. The three phases share port 8787, so each
+	// cannot start until the previous wrangler has fully exited — that is what
+	// the awaited shutdown() inside each phase's `finally` guarantees. Fail-fast
 	// is deliberate on top of that: a phase-1 failure usually means the server
-	// itself is broken, in which case phase 2's failures would be noise on top of
-	// the real one. One phase runs, one exit code.
+	// itself is broken, in which case the later phases' failures would be noise
+	// on top of the real one. One phase runs, one exit code.
 	await runEnvModePhase();
 	// The listening socket is released as the process dies, but the release is
 	// not synchronous with the exit event. Give the port a moment rather than
-	// racing phase 2's bind against it.
+	// racing the next phase's bind against it.
 	await sleep(1_000);
 	await runClaimModePhase();
+	await sleep(1_000);
+	await runStrictModePhase();
 }
 
 main().catch((err) => {

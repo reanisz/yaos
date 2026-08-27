@@ -32,6 +32,27 @@ export interface Env {
 	 */
 	YAOS_ENABLE_ADMIN_ROUTES?: string;
 	/**
+	 * Set to any non-empty string to run the server in STRICT PERMISSIONS mode.
+	 *
+	 * Unset (the default), everything behaves exactly as it always has: the
+	 * claim flow, a claimed token that opens every vault, and per-vault tokens
+	 * as an additive feature.
+	 *
+	 * Set, the server-wide credential stops existing: the claimed token and
+	 * SYNC_TOKEN authorize NOTHING, `POST /claim` answers 403, and the only
+	 * credentials are per-vault, per-device tokens issued from the
+	 * Access-gated /admin page — which works even on a server nobody ever
+	 * claimed.  SYNC_TOKEN set alongside it is ignored (fail closed), with one
+	 * console.warn per isolate.
+	 *
+	 * In practice this requires Cloudflare Access to be configured, since
+	 * /admin is the only surface that can issue a token; with Access
+	 * unconfigured the server is simply locked, and says so once per isolate.
+	 *
+	 * See docs/architecture/zero-config-auth.md, "strict_permissions mode".
+	 */
+	YAOS_STRICT_PERMISSIONS?: string;
+	/**
 	 * Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com" (a bare
 	 * "myteam" and a full https:// URL are both accepted and normalized).
 	 *
@@ -64,9 +85,23 @@ export interface Env {
 
 export type JsonResponse = (body: unknown, status?: number) => Response;
 
+/**
+ * The strict-mode variant carries `claimed: true` deliberately, whatever the
+ * server's actual claim state.
+ *
+ * `claimed` is not a fact about strict mode, it is the flag every existing
+ * rejection path reads to answer "is this server usable yet": the 503 in
+ * rejectUnauthorizedVaultRequest, the `unclaimed` fatal socket frame, the
+ * vault-token route gate.  A strict server IS usable — its tokens are issued
+ * through /admin, which needs no claim — so those paths must not fire, and
+ * `mode` is what gates behaviour instead.  Nothing in strict mode consults the
+ * claimed flag for anything else, and `POST /claim` is refused from the
+ * environment alone before any of this is built.
+ */
 export type AuthState =
 	| { mode: "env"; claimed: true; envToken: string }
 	| { mode: "claim"; claimed: true; tokenHash: string; config?: StoredServerConfig }
+	| { mode: "strict"; claimed: true; config: StoredServerConfig }
 	| { mode: "unclaimed"; claimed: false; config?: StoredServerConfig };
 
 /**
@@ -82,6 +117,7 @@ export type AuthState =
 export type AuthStateCached =
 	| { mode: "env"; claimed: true; envToken: string }
 	| { mode: "claim"; claimed: true; tokenHash: string; config: StoredServerConfig }
+	| { mode: "strict"; claimed: true; config: StoredServerConfig }
 	| { mode: "unclaimed"; claimed: false; config: StoredServerConfig };
 
 export type FatalAuthCode = "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required";
