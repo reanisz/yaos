@@ -1412,6 +1412,7 @@ s.section("Test 21: the admin page renders the strict UI, unclaimed included");
 		);
 		s.check(html.includes("<form"), "the strict page renders the issue form even unclaimed");
 		s.check(html.includes("Strict permissions mode is active"), "the page carries a strict-mode banner");
+		s.check(html.includes("mode: strict permissions"), "the header badge names the mode");
 		s.check(html.includes("Device name (required)"), "the device-name field is labelled as required");
 		s.check(
 			/<input id="token-label"[^>]*\brequired\b/.test(html),

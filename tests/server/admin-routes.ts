@@ -433,6 +433,7 @@ s.section("Test 4: on an unclaimed server the page explains itself and the API a
 			"the unclaimed page is served as HTML",
 		);
 		s.check(html.includes("not claimed yet"), "the page says the server is not claimed");
+		s.check(html.includes("mode: standard (unclaimed)"), "the header badge names the mode");
 		s.check(!html.includes("<form"), "the unclaimed page renders no issue form");
 
 		for (const [method, path] of ADMIN_SHAPES.slice(1)) {
@@ -666,6 +667,7 @@ s.section("Test 8: the admin page is HTML, uncached, and carries no token materi
 		s.check(!html.includes(token), "the page does not contain the issued token");
 		s.check(!html.includes(await hashOf(token)), "the page does not contain the stored hash");
 		s.check(!html.includes("tokenHash"), "the page does not mention tokenHash");
+		s.check(html.includes("mode: standard (claimed)"), "the header badge names the mode");
 		// The vault ID and label reach the page through the JSON API and the DOM,
 		// never through the rendered shell.
 		s.check(!html.includes(VAULT_A), "the page shell carries no per-vault data");
@@ -738,6 +740,7 @@ s.section("Test 9: in env mode the API answers 409 and the page explains why");
 		const html = await page.text();
 		s.check(page.status === 200, "GET /admin in env mode → 200");
 		s.check(html.includes("SYNC_TOKEN"), "the page names the environment variable responsible");
+		s.check(html.includes("mode: environment token"), "the header badge names the mode");
 		s.check(!html.includes("<form"), "the env-mode page renders no issue form");
 
 		s.check(configTrap.touched.length === 0, "env mode did not touch YAOS_CONFIG");

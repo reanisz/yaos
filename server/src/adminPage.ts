@@ -81,6 +81,10 @@ const ADMIN_PAGE_STYLE = `
       color: #7bdff6;
       word-break: break-all;
     }
+    .mode-badge {
+      margin-left: 8px;
+      color: #ffd08a;
+    }
     .card {
       background: rgba(8, 17, 29, 0.6);
       border: 1px solid rgba(161, 205, 255, 0.14);
@@ -727,6 +731,24 @@ function renderUnavailableState(authMode: "env" | "unclaimed"): string {
     </section>`;
 }
 
+/**
+ * Human-readable label for the server's current auth mode, shown as a badge in
+ * the header so an operator can tell at a glance which regime this deployment
+ * is running — strict is visually loud elsewhere, but the other three were
+ * previously only implied by which UI happened to render.
+ *
+ * Compile-time constants chosen by the mode; nothing here is user input, so no
+ * escaping is required (same reasoning as the markup blocks above).
+ */
+function modeLabel(authMode: AdminPageOptions["authMode"]): string {
+	switch (authMode) {
+		case "strict": return "strict permissions";
+		case "claim": return "standard (claimed)";
+		case "env": return "environment token";
+		case "unclaimed": return "standard (unclaimed)";
+	}
+}
+
 /** Header copy.  Strict mode manages devices; claim mode manages vaults. */
 function renderHeaderCopy(authMode: AdminPageOptions["authMode"]): { title: string; blurb: string } {
 	if (authMode === "strict") {
@@ -781,6 +803,7 @@ export function renderAdminPage(options: AdminPageOptions): string {
       <h1>${title}</h1>
       <p>${blurb}</p>
       <div class="host-badge">${safeHost}</div>
+      <div class="host-badge mode-badge">mode: ${modeLabel(options.authMode)}</div>
     </header>
 ${body}
   </main>${script}
